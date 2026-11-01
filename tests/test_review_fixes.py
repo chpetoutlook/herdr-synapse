@@ -206,8 +206,8 @@ class CompactionRebriefTests(unittest.TestCase):
     def test_the_delivery_table_replaces_both_lists_without_changing_them(self):
         self.assertEqual(D.URGENT_SYSTEM_EVENTS, ("charter_updated", "member_joined", "knowledge_updated", "instructions_updated", "manager_changed"))
         self.assertEqual(D.TOAST_SYSTEM_EVENTS, ("manager_changed", "fact_conflict", "schedule_failed", "canvas_sent"))
-        self.assertEqual(D.NAMED_SYSTEM_EVENTS, ("context_high", "model_changed", "profile_changed", "link_established", "link_broken", "work_ready", "fact_conflict",
-                                                 "canvas_sent"))
+        self.assertEqual(D.NAMED_SYSTEM_EVENTS, ("context_high", "model_changed", "profile_changed", "link_established", "link_broken", "work_ready", "work_review",
+                                                 "manager_nudge", "leader_pending", "manager_sweep", "idle_agent", "fact_conflict", "canvas_sent"))
         declared_without_wake = {e for e, d in D.SYSTEM_EVENT_DELIVERY.items() if not d.get("wake")}
         self.assertEqual(declared_without_wake, {"link_read", "board_cleared", "work_cancelled", "fact_added", "fact_retired", "fact_disputed", "fact_resolved",
                                                  "contradictions_changed", "schedule_failed", "schedule_missed", "canvas_changed", "whiteboard_state"},

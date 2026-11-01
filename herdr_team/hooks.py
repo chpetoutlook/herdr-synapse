@@ -608,15 +608,41 @@ def _reconcile_available(layout: Layout, api: Any, teams: Dict[str, Dict[str, An
 # entry point
 
 
+#: Pending Windows stand-in timers for ``SIGALRM`` (which Windows has not).
+_ALARM_TIMERS: List[threading.Timer] = []
+
+
 def _install_alarm(seconds: int, on_fire: Any) -> bool:
     if threading.current_thread() is not threading.main_thread():
         return False
+    if not hasattr(signal, "SIGALRM"):
+        # Windows has no ``SIGALRM``: a timer thread stands in for it, so the
+        # hook still gives up instead of blocking the event pipeline.
+        timer = threading.Timer(float(seconds), lambda: on_fire(0, None))
+        timer.daemon = True
+        timer.start()
+        _ALARM_TIMERS.append(timer)
+        return True
     try:
         signal.signal(signal.SIGALRM, on_fire)
         signal.alarm(int(seconds))
     except (ValueError, OSError, AttributeError):
         return False
     return True
+
+
+def _cancel_alarm() -> None:
+    """Cancel the alarm/timer the hook armed."""
+    while _ALARM_TIMERS:
+        timer = _ALARM_TIMERS.pop()
+        try:
+            timer.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        signal.alarm(0)
+    except (ValueError, OSError, AttributeError):
+        pass
 
 
 def _daemon_alive(layout: Layout) -> bool:
@@ -701,10 +727,7 @@ def run_hook_event(argv: Sequence[str], env: Dict[str, str], api: Any = None, st
         return finish()
     finally:
         if armed:
-            try:
-                signal.alarm(0)
-            except (ValueError, OSError):
-                pass
+            _cancel_alarm()
 
 
 # --------------------------------------------------------------------------

@@ -17,8 +17,24 @@ from unittest import mock
 
 from support import FakeApi, TempState, fake_pane, fake_plugin_pane_opened
 
-from herdr_team import cli, cmd_board, cmd_ui, store
+from herdr_team import cli, cmd_board, cmd_ui, paths, store
 from herdr_team.errors import HerdrTeamError
+
+
+# ---------------------------------------------------------------------------
+# The entrypoint ids are the PRODUCT's, not this file's.
+#
+# The Windows manifest registers a `-windows` twin for every entrypoint, so
+# the product asks herdr for `compose-windows`, `picker-windows` and
+# `console-windows` there. Asking herdr for the unix id on Windows gets
+# `platform_unsupported` - the defect W-15 fixed for the daemon's asks popup -
+# so a test that hardcoded the unix ids could not see the seam at all: its
+# fakes never fired and the popup paths it guards were DARK on Windows.
+#
+# So this file asks the product for the id (`paths.entrypoint_id(...)`), the
+# W-9 settlement the port already used twice for this same reason. The test
+# keeps its meaning on BOTH platforms instead of being skipped.
+# ---------------------------------------------------------------------------
 
 
 def run_cli(argv, env, api=None):
@@ -46,7 +62,7 @@ class OpenPaneResultShapeTests(unittest.TestCase):
         api.set_response("plugin.pane.open", fake_plugin_pane_opened("console", console_pane("w1:p9")))
         payload = cmd_ui.open_pane(api, "console", None, {}, "alpha")
         self.assertEqual(payload, {"ui": "console", "opened": True, "placement": "split", "pane_id": "w1:p9", "fallback": None, "retried": False})
-        self.assertEqual(api.calls[0][1]["entrypoint"], "console")
+        self.assertEqual(api.calls[0][1]["entrypoint"], paths.entrypoint_id("console"))
         self.assertEqual(api.calls[0][1]["env"], {"HERDR_TEAM": "alpha"})
 
     def test_popup_ok_reports_a_null_pane_id(self):
@@ -56,7 +72,8 @@ class OpenPaneResultShapeTests(unittest.TestCase):
             payload = cmd_ui.open_pane(api, target, None, {}, None)
             self.assertEqual((payload["ui"], payload["placement"], payload["pane_id"], payload["fallback"]), (target, "popup", None, None), target)
         who = [p for m, p in api.calls if m == "plugin.pane.open"][-1]
-        self.assertEqual((who["entrypoint"], who["placement"], who["env"]), ("console", "popup", {cmd_ui.WHO_ENV: "who"}))
+        self.assertEqual((who["entrypoint"], who["placement"], who["env"]),
+                         (paths.entrypoint_id("console"), "popup", {cmd_ui.WHO_ENV: "who"}))
 
     def test_legacy_top_level_ids_are_not_required(self):
         # The old parser looked for ``pane_id`` / ``id`` at the top level; the
@@ -71,7 +88,7 @@ class OpenPaneResultShapeTests(unittest.TestCase):
 
         def open_pane(params):
             seen.append(params)
-            if params["entrypoint"] == "picker":
+            if params["entrypoint"] == paths.entrypoint_id("picker"):
                 raise HerdrTeamError("plugin_pane_open_failed", "popup already open", 1)
             return fake_plugin_pane_opened("console", console_pane("w1:p9"))
 
@@ -79,7 +96,9 @@ class OpenPaneResultShapeTests(unittest.TestCase):
         payload = cmd_ui.open_pane(api, "picker", None, {"HERDR_PANE_ID": "w1:p2"}, "alpha", sleep=lambda _s: None)
         self.assertEqual((payload["ui"], payload["opened"], payload["placement"], payload["pane_id"], payload["fallback"], payload["retried"]), ("picker", True, "split", "w1:p9", "console", True))
         self.assertEqual(payload["error"]["code"], "plugin_pane_open_failed")
-        self.assertEqual([p["entrypoint"] for p in seen], ["picker", "picker", "console"])
+        self.assertEqual([p["entrypoint"] for p in seen],
+                         [paths.entrypoint_id("picker"), paths.entrypoint_id("picker"),
+                          paths.entrypoint_id("console")])
         self.assertEqual((seen[2]["placement"], seen[2]["target_pane_id"]), ("split", "w1:p2"))
 
 
@@ -119,7 +138,8 @@ class ReconcileConsoleTests(unittest.TestCase):
             result = cmd_ui.reconcile_console(ts.layout, api, dict(ts.env))
             self.assertEqual((result["closed"], result["reopened"]), (["w1:p2"], "w1:p9"))
             opened = [p for m, p in api.calls if m == "plugin.pane.open"]
-            self.assertEqual((len(opened), opened[0]["entrypoint"], opened[0]["env"]), (1, "console", {"HERDR_TEAM": "alpha"}))
+            self.assertEqual((len(opened), opened[0]["entrypoint"], opened[0]["env"]),
+                             (1, paths.entrypoint_id("console"), {"HERDR_TEAM": "alpha"}))
             self.assertFalse(any(e.get("open") for e in cmd_board.console_entries(ts.session).values()))
 
     def test_unknown_foreground_and_launch_grace_are_reported_as_unresolved(self):
@@ -219,7 +239,7 @@ class PopupTargetPaneTests(unittest.TestCase):
 
         def open_pane(params):
             seen.append(params)
-            if params["entrypoint"] == "compose":
+            if params["entrypoint"] == paths.entrypoint_id("compose"):
                 if "target_pane_id" in params:
                     raise HerdrTeamError("invalid_params", "overlay and popup plugin panes target the active pane", 1)
                 raise HerdrTeamError("plugin_pane_open_failed", "popup already open", 1)
@@ -228,7 +248,9 @@ class PopupTargetPaneTests(unittest.TestCase):
         api.set_response("plugin.pane.open", open_pane)
         payload = cmd_ui.open_pane(api, "compose", "w1:p4", {}, "alpha", sleep=lambda _s: None)
         self.assertEqual((payload["retried"], payload["fallback"], payload["pane_id"], payload["error"]["code"]), (True, "console", "w1:p9", "plugin_pane_open_failed"))
-        self.assertEqual([p["entrypoint"] for p in seen], ["compose", "compose", "console"])
+        self.assertEqual([p["entrypoint"] for p in seen],
+                         [paths.entrypoint_id("compose"), paths.entrypoint_id("compose"),
+                          paths.entrypoint_id("console")])
         self.assertEqual((seen[2]["placement"], seen[2]["target_pane_id"]), ("split", "w1:p4"))
 
 
@@ -276,11 +298,13 @@ class FallbackReusesLiveConsoleTests(unittest.TestCase):
 
             def open_pane(params):
                 seen.append(params)
-                if params["entrypoint"] == "compose":
+                if params["entrypoint"] == paths.entrypoint_id("compose"):
                     raise HerdrTeamError("plugin_pane_open_failed", "popup already open", 1)
                 return fake_plugin_pane_opened("console", console_pane("w1:p9"))
 
             api.set_response("plugin.pane.open", open_pane)
             payload = cmd_ui.open_pane(api, "compose", "w1:p4", dict(ts.env), "alpha", sleep=lambda _s: None, layout=ts.layout)
             self.assertEqual((payload["opened"], payload["fallback"], payload["pane_id"]), (True, "console", "w1:p9"))
-            self.assertEqual([p["entrypoint"] for p in seen], ["compose", "compose", "console"])
+            self.assertEqual([p["entrypoint"] for p in seen],
+                         [paths.entrypoint_id("compose"), paths.entrypoint_id("compose"),
+                          paths.entrypoint_id("console")])

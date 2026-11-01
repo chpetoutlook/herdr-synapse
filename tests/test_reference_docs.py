@@ -22,8 +22,9 @@ class ReferenceDocsTests(unittest.TestCase):
 
     def test_every_cli_command_appears_once(self):
         commands = load_commands()
-        self.assertEqual(len(commands), 98)
-        self.assertEqual(len([command for command in commands if not command.hidden]), 87)
+        # 99 = 98 upstream + ``superuser`` (W-16 designated superuser pane/session).
+        self.assertEqual(len(commands), 99)
+        self.assertEqual(len([command for command in commands if not command.hidden]), 88)
         self.assertEqual(len([command for command in commands if command.hidden]), 11)
         section = self._section("cli")
         for command in commands:
@@ -34,9 +35,25 @@ class ReferenceDocsTests(unittest.TestCase):
         section = self._section("actions")
         manifest = reference_docs.MANIFEST_PATH.read_text(encoding="utf-8")
         actions = reference_docs.manifest_actions(manifest)
-        self.assertEqual(len(actions), 10)
+        # The port registers a -windows twin beside every upstream action - the
+        # manifest alternates the unix action with its twin, and
+        # tests/test_scaffold.py asserts the same alternation for the actions,
+        # the startup entries and the panes - so the reference lists the ten
+        # upstream actions and their ten windows twins.
+        self.assertEqual(len(actions), 20)
+        ids = [str(action["id"]) for action in actions]
+        self.assertEqual(len(set(ids)), len(ids), "duplicate manifest action id")
+        windows_ids = [action_id for action_id in ids if action_id.endswith("-windows")]
+        self.assertEqual(len(windows_ids), 10)
+        for action_id in windows_ids:
+            self.assertIn(action_id[:-len("-windows")], ids, action_id)
         for action in actions:
-            invocation = "herdr plugin action invoke {}.{}".format(reference_docs.PLUGIN_ID, action["id"])
+            # The invocation is counted as the rendered cell (backticked), not as
+            # a bare prefix: the port's twin ids end in "-windows", so the unix
+            # invocation "herdr plugin action invoke herdr-synapse.team-up" is a
+            # prefix of the twin's "herdr-synapse.team-up-windows" and a bare
+            # count would read the twin as a second occurrence.
+            invocation = "`herdr plugin action invoke {}.{}`".format(reference_docs.PLUGIN_ID, action["id"])
             self.assertEqual(section.count(invocation), 1, action["id"])
         for action in cmd_misc.KEY_ACTIONS:
             row = "| `{}` | `{}` |".format(

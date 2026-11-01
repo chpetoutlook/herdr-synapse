@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from support import FAKE_AGENTS, FAKE_MEMBERS, PLUGIN_ROOT, FakeApi, TempState, fake_agent
+from support import FAKE_AGENTS, FAKE_MEMBERS, PLUGIN_ROOT, FakeApi, TempState, assert_mode, fake_agent, requires_posix
 
 from herdr_team import cmd_board, compose, console, paths, picker, store, tui_model
 from herdr_team.errors import HerdrTeamError
@@ -1365,7 +1365,11 @@ class ConsoleRuntimeTests(unittest.TestCase):
             console.write_console_record(ts.layout, {"pane_id": "wC:p1", "open": True})
             doc = console.read_console_json(ts.layout)
             self.assertEqual(doc, {"pane_id": "wC:p1", "open": True})
-            self.assertEqual(oct(ts.session.console_json.stat().st_mode & 0o777), "0o600")
+            # The mode bit is a POSIX fact: Windows has no POSIX mode bits
+            # (chmod only toggles the read-only flag), so it is asserted on
+            # unix alone and the Windows behaviour is stated rather than
+            # skipped (the suite's own idiom, support.assert_mode).
+            assert_mode(ts.session.console_json, 0o600)
             import argparse
 
             args = argparse.Namespace(env=ts.env, team=None, session=None, socket=None, json=False, target_pane=None, force=False)
@@ -1378,8 +1382,29 @@ class ConsoleRuntimeTests(unittest.TestCase):
             self.assertEqual(ctx.exception.code, "not_a_plugin_pane")
 
     def test_sigterm_unwinds_through_the_finally_and_records_closed(self):
-        """UI-05 (rig, 2026-09-05): ``kill -TERM <console pid>`` left open:true and a hint pane waiting for a key."""
+        """UI-05 (rig, 2026-09-05): ``kill -TERM <console pid>`` left open:true and a hint pane waiting for a key.
+
+        POSIX only. The test delivers SIGTERM to its OWN process and asserts
+        that the handler unwinds through the ``finally``. On Windows
+        ``os.kill(pid, SIGTERM)`` IS ``TerminateProcess``: the pytest process
+        dies at once, the ``finally`` never runs, and the whole test RUNNER
+        dies with it - so the full suite ends at 87 percent with no summary
+        (measured 2026-10-22, synapsem W-5; it is the only
+        ``os.kill(os.getpid()`` site in the 220 test files the product
+        ships).
+
+        The PRODUCT is right for Windows: there is no SIGTERM delivery for a
+        console-less process, so the console stops through the stop file the
+        daemon polls (port README section 8). The TEST is POSIX-shaped, so
+        it is settled the way the suite settles its other POSIX cases: with
+        a stated reason (2026-10-22 port fix, W-5).
+        """
         import signal
+
+        requires_posix("SIGTERM delivery to this process is POSIX-only: on Windows "
+                       "os.kill(pid, SIGTERM) is TerminateProcess, which would kill the "
+                       "test runner; the product stops the console through the stop file "
+                       "instead")
 
         with TempState() as ts:
             console.write_console_record(ts.layout, {"default_team": "alpha", "open": False})

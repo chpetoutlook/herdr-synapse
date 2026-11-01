@@ -55,7 +55,7 @@ def own_process_info(pane_id: str, shell_pid: Optional[int] = None) -> Dict[str,
         "type": "pane_process_info",
         "process_info": {
             "pane_id": pane_id, "shell_pid": shell_pid if shell_pid is not None else os.getppid(), "tty": "/dev/ttys001",
-            "foreground_process_group_id": os.getpgrp(),
+            "foreground_process_group_id": identity.own_pgrp(),
             "foreground_processes": [{"pid": os.getpid(), "name": "python3"}],
         },
     }
@@ -68,7 +68,7 @@ def own_shell_rig(pane_id: str):
     group (it is not under some harnesses), so the leader is mapped to a fake
     shell pid in the table, exactly as ``test_process_group_match_is_verified`` does.
     """
-    leader = os.getpgrp()
+    leader = identity.own_pgrp()
     fake_shell = 777
     shell_pid = os.getppid() if leader == os.getpid() else fake_shell
     info = {"type": "pane_process_info", "process_info": {
@@ -207,7 +207,17 @@ class ConsoleTierTests(unittest.TestCase):
             self.assertTrue(author.is_human)
             self.assertEqual(author.via, identity.VIA_CLI_UNVERIFIED)
             self.assertFalse(author.verified)
-            self.assertIn("term_other", author.reason or "")
+            if os.name == "nt":
+                # The recorded console pid (1) is alive on unix but not on
+                # Windows, so the two platforms stop at different branches:
+                # unix reaches the terminal-mismatch reason, Windows stops
+                # earlier at "no live console". Both are cli_unverified
+                # (asserted above) - only the wording differs, and the product
+                # must not change to satisfy the test (2026-10-21 port fix, W-9).
+                self.assertIn("term_console", author.reason or "")
+                self.assertIn("live consoles", author.reason or "")
+            else:
+                self.assertIn("term_other", author.reason or "")
 
     def test_console_without_pane_id_stays_unverified(self) -> None:
         with TempState() as ts:
@@ -434,7 +444,7 @@ class ShellPaneTests(unittest.TestCase):
             self.assertFalse(author.verified)
             self.assertIn("not ours", author.reason or "")
             self.assertEqual(author.terminal_id, "term_shell")
-            self.assertEqual(author.origin["pgrp"], os.getpgrp())
+            self.assertEqual(author.origin["pgrp"], identity.own_pgrp())
             self.assertFalse(identity.human_origin_ok(author.origin))
 
     def test_process_info_unavailable_is_unverified(self) -> None:
@@ -445,7 +455,7 @@ class ShellPaneTests(unittest.TestCase):
 
     def test_process_group_match_is_verified(self) -> None:
         with TempState() as ts:
-            leader = os.getpgrp()
+            leader = identity.own_pgrp()
             fake_shell = 777
             shell_pid = os.getppid() if leader == os.getpid() else fake_shell
             api = make_api()
@@ -463,7 +473,7 @@ class ShellPaneTests(unittest.TestCase):
 
     def test_leader_parent_mismatch_is_unverified(self) -> None:
         with TempState() as ts:
-            leader = os.getpgrp()
+            leader = identity.own_pgrp()
             api = make_api()
             api.set_response("pane.process_info", {"type": "pane_process_info", "process_info": {
                 "pane_id": "w3:p9", "shell_pid": 1, "foreground_process_group_id": leader, "foreground_processes": [],
@@ -554,6 +564,14 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(own, [os.getpid(), os.getppid()])
 
     def test_ps_table_reads_real_processes(self) -> None:
+        if os.name == "nt":
+            # `ps` is a unix tool: the process table is read from it, and the
+            # port documents identity.ps_table as unix-only (the Windows
+            # equivalent would need a Toolhelp32 implementation). The Windows
+            # shape is that the table is simply absent, so the shell-ancestry
+            # verification stays unverified here (2026-10-21 port fix, W-9).
+            self.assertIsNone(identity.ps_table())
+            return
         table = identity.ps_table()
         self.assertIsNotNone(table)
         assert table is not None
@@ -562,15 +580,15 @@ class HelperTests(unittest.TestCase):
     def test_verify_shell_ancestry_reasons(self) -> None:
         api = FakeApi()
         api.set_response("pane.process_info", {"type": "pane_process_info", "process_info": {"pane_id": "w3:p9", "shell_pid": 5, "foreground_process_group_id": None}})
-        ok, reason = identity.verify_shell_ancestry(api, "w3:p9", os.getpgrp())
+        ok, reason = identity.verify_shell_ancestry(api, "w3:p9", identity.own_pgrp())
         self.assertFalse(ok)
         self.assertIn("no foreground process group", reason or "")
-        api.set_response("pane.process_info", {"type": "pane_process_info", "process_info": {"pane_id": "w3:p9", "shell_pid": None, "foreground_process_group_id": os.getpgrp()}})
-        ok, reason = identity.verify_shell_ancestry(api, "w3:p9", os.getpgrp())
+        api.set_response("pane.process_info", {"type": "pane_process_info", "process_info": {"pane_id": "w3:p9", "shell_pid": None, "foreground_process_group_id": identity.own_pgrp()}})
+        ok, reason = identity.verify_shell_ancestry(api, "w3:p9", identity.own_pgrp())
         self.assertFalse(ok)
         self.assertIn("no shell pid", reason or "")
         api.set_error("pane.process_info", "pane_not_found", "nope")
-        ok, reason = identity.verify_shell_ancestry(api, "w3:p9", os.getpgrp())
+        ok, reason = identity.verify_shell_ancestry(api, "w3:p9", identity.own_pgrp())
         self.assertFalse(ok)
         self.assertIn("unavailable", reason or "")
 

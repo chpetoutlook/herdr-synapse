@@ -190,9 +190,13 @@ class SpawnTests(unittest.TestCase):
         cmd_roster._monotonic = monotonic
 
     def test_agent_start_carries_the_flags_after_a_double_dash(self):
+        # The timeout is the launcher's constant, not a literal here: it was raised
+        # from 60 s to 300 s (a slow Windows host needs it), and a pinned literal
+        # went stale instead of the behaviour.
+        timeout = str(cmd_roster.AGENT_START_TIMEOUT_MS)
         self.assertEqual(cmd_roster.agent_start_argv("n", "codex", "w9:p1", args=["-m", "gpt-5.6-luna"]),
-                         ["agent", "start", "n", "--kind", "codex", "--pane", "w9:p1", "--timeout", "60000", "--", "-m", "gpt-5.6-luna"])
-        self.assertEqual(cmd_roster.agent_start_argv("n", "codex", "w9:p1"), ["agent", "start", "n", "--kind", "codex", "--pane", "w9:p1", "--timeout", "60000"])
+                         ["agent", "start", "n", "--kind", "codex", "--pane", "w9:p1", "--timeout", timeout, "--", "-m", "gpt-5.6-luna"])
+        self.assertEqual(cmd_roster.agent_start_argv("n", "codex", "w9:p1"), ["agent", "start", "n", "--kind", "codex", "--pane", "w9:p1", "--timeout", timeout])
 
     def test_create_new_starts_each_agent_with_its_setting_and_records_the_defaults(self):
         with TempState(write_team=False) as ts:
@@ -245,8 +249,12 @@ class SpawnTests(unittest.TestCase):
             self.assertEqual(code, 0, err)
             start = next(argv for argv in api.runs if argv[:2] == ["agent", "start"])
             extra = start[start.index("--") + 1:]
-            self.assertEqual(extra[:-1], ["-m", "opencode/glm-5.3-flash", "--auto", "--hostname", "127.0.0.1", "--port"])
-            self.assertTrue(1 <= int(extra[-1]) <= 65535)
+            # OpenCode v2.1+ manages its own server port: the launcher passes no
+            # --hostname/--port (they are rejected), and the port is recorded for
+            # the session record instead.
+            self.assertEqual(extra, ["-m", "opencode/glm-5.3-flash", "--auto"])
+            self.assertNotIn("--hostname", extra)
+            self.assertNotIn("--port", extra)
             jobs = [store.read_json(path) for path in ts.session.team("delta").jobs_dir.glob("*.json")]
             self.assertEqual(len(jobs), 1)
             self.assertEqual((jobs[0]["kind"], jobs[0]["action"]), ("control", "model"))

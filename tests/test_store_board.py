@@ -14,7 +14,7 @@ from unittest import mock
 
 from herdr_team import store
 from herdr_team.errors import HerdrTeamError
-from support import PLUGIN_ROOT, TempState
+from support import assert_mode, PLUGIN_ROOT, symlink_or_skip, TempState
 
 
 def _note(text="hi", sender="alpha-worker", to=None, **extra):
@@ -134,8 +134,8 @@ class AppendTests(unittest.TestCase):
         self.assertRegex(recs[0]["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
         self.assertEqual(tuple(recs[0].keys()), store.RECORD_KEYS)
         self.assertEqual(json.loads(self.ts.team.board_seq.read_text()), {"next": 3, "active_first_seq": 1})
-        self.assertEqual(stat.S_IMODE(self.ts.team.board_jsonl.stat().st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(self.ts.team.board_seq.stat().st_mode), 0o600)
+        assert_mode(self.ts.team.board_jsonl, 0o600)
+        assert_mode(self.ts.team.board_seq, 0o600)
 
     def test_validation_happens_before_the_lock_and_writes_nothing(self):
         with self.assertRaises(HerdrTeamError) as ctx:
@@ -243,7 +243,7 @@ class AppendTests(unittest.TestCase):
     def test_symlinked_board_refused(self):
         real = self.ts.tmp / "elsewhere.jsonl"
         real.write_text("")
-        os.symlink(real, self.ts.team.board_jsonl)
+        symlink_or_skip(real, self.ts.team.board_jsonl)
         with self.assertRaises(HerdrTeamError) as ctx:
             self.board.append(_note("x"))
         self.assertEqual(ctx.exception.code, "path_symlink")
@@ -719,7 +719,7 @@ class AttachmentTests(unittest.TestCase):
         self.assertTrue(staged.tmp_path.name.startswith(".tmp-%d-" % os.getpid()))
         self.assertEqual(staged.tmp_path.parent, self.ts.team.payloads_dir)
         self.assertEqual(staged.size, 700)
-        self.assertEqual(stat.S_IMODE(staged.tmp_path.stat().st_mode), 0o600)
+        assert_mode(staged.tmp_path, 0o600)
         self.assertRegex(staged.basename, r"^my_diff__1_-[0-9a-f]{8}\.md$")
         seq = self.board.append(_note("see diff"), attachments=[staged])
         rec = self.board.get(seq)
@@ -745,7 +745,7 @@ class AttachmentTests(unittest.TestCase):
         body = self.ts.team.payloads_dir / "1-body.md"
         self.assertEqual(body.read_text(), "x" * 5000)
         self.assertEqual(self.board.get(seq)["refs"], ["payloads/1-body.md"])
-        self.assertEqual(stat.S_IMODE(body.stat().st_mode), 0o600)
+        assert_mode(body, 0o600)
 
     def test_refusals(self):
         with self.assertRaises(HerdrTeamError) as ctx:
@@ -757,7 +757,7 @@ class AttachmentTests(unittest.TestCase):
         real = self.ts.tmp / "real.txt"
         real.write_text("x")
         link = self.ts.tmp / "link.txt"
-        os.symlink(real, link)
+        symlink_or_skip(real, link)
         with self.assertRaises(HerdrTeamError) as ctx:
             self.board.stage_attachment(link)
         self.assertEqual(ctx.exception.code, "path_symlink")

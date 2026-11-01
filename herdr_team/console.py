@@ -422,7 +422,15 @@ def write_console_record(layout: Layout, record: Dict[str, Any]) -> None:
 
 
 def cli_path() -> Path:
-    return _paths.plugin_root() / "bin" / "herdr-synapse"
+    """The launcher this platform can actually run.
+
+    Windows cannot run the POSIX sh script at all, so the console was
+    shelling out to a file that is not executable here - and the asks
+    console could not land an answer, whatever it said afterwards
+    (2026-10-21 port fix, W-23). The unix path is unchanged: the same
+    ``bin/herdr-synapse``.
+    """
+    return _paths.cli_launcher_path()
 
 
 def run_cli(args: Sequence[str], env: Dict[str, str], timeout: float = CLI_TIMEOUT_S) -> Tuple[int, Any, Optional[Dict[str, Any]]]:
@@ -1273,8 +1281,9 @@ def run_args(args: argparse.Namespace) -> int:
     layout = _cli.layout_for(args)
     entry = env.get("HERDR_PLUGIN_ENTRYPOINT_ID")
     target = getattr(args, "target_pane", None)
-    if entry != ENTRYPOINT and not target and not getattr(args, "force", False):
+    if not _paths.entrypoint_matches(env, ENTRYPOINT) and not target and not getattr(args, "force", False):
         raise HerdrTeamError("not_a_plugin_pane", "console runs in the plugin pane; use `herdr-synapse ui console` or pass --target-pane <id>", EXIT_REFUSED)
+    _paths.require_vendor_curses(env)
     if not _paths.socket_allowed(layout.config_dir, layout.socket):
         # Plan 4.1 / PK-07: an unlisted socket makes the pane a no-op before any
         # socket call or console.json write, so console.sh shows the hint.

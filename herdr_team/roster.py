@@ -1045,6 +1045,39 @@ def migrate_cursor(team_paths: TeamPaths, old_name: str, new_name: str) -> bool:
         return False
 
 
+def migrate_operator_grant(session: SessionPaths, team: str, old_name: str, new_name: str) -> bool:
+    """Carry a renamed member's operator delegation to its new name.
+
+    A delegation is keyed ``team/member`` in ``operators.json``, so a rename
+    that does not move it leaves the grant stranded under a name nobody holds:
+    the member silently loses the authority the operator granted, and anybody
+    who later takes the old name would inherit it. The delegation follows the
+    person, the way the cursor and the pane record do.
+
+    Best effort, like ``migrate_cursor``: a missing grant, an existing target
+    grant, or an unreadable file leaves the rename alone rather than failing
+    it.
+    """
+    if old_name == new_name:
+        return False
+    try:
+        from herdr_team import operator as _operator
+
+        grants = _operator.read(session)
+        old_key = _operator._key(team, old_name)
+        new_key = _operator._key(team, new_name)
+        entry = grants.get(old_key)
+        if not isinstance(entry, dict) or new_key in grants:
+            return False
+        moved = dict(entry, member=new_name)
+        grants.pop(old_key, None)
+        grants[new_key] = moved
+        _operator._write(session, grants)
+        return True
+    except (HerdrTeamError, OSError, ValueError):
+        return False
+
+
 def append_system_record(team_paths: TeamPaths, event: str, text: str, to: Optional[Sequence[str]] = None, extra: Optional[Dict[str, Any]] = None, socket: Optional[str] = None) -> int:
     """Append a ``system`` record through ``store.BoardStore`` (plan 6.2 append sequence)."""
     record = system_record(event, text, to=to, extra=extra, socket=socket)
@@ -1940,6 +1973,14 @@ class Roster:
         destination = self.layout.session.team_archive(self.name, stamp)
         ensure_dir(self.layout.session.archive_dir)
         with store.team_lock(self.paths):
+            if os.name != "nt":
+                os.rename(self.paths.root, destination)
+        if os.name == "nt":
+            # Windows cannot rename a directory while a file inside it is open,
+            # and the team lock IS a file inside it (the lock handle is open for
+            # the whole `with` block). So on Windows the rename happens with the
+            # lock released: the same tree lands in the archive either way
+            # (2026-10-21 port fix).
             os.rename(self.paths.root, destination)
         return {"team": self.name, "archived_to": os.fspath(destination), "members_cleared": cleared,
                 "recoverable": recoverable_from(destination, self.name)}
@@ -1971,6 +2012,15 @@ class Roster:
         self.update(mutate)
         member = adopted[0]
         migrate_cursor(self.paths, member_name, member.name)
+        # The delegation follows the person: without this a rename silently
+        # strips the operator authority the member holds, and strands the
+        # grant under a name nobody holds (where anyone who later takes that
+        # name would inherit it).
+        if migrate_operator_grant(self.layout.session, self.name, member_name, member.name):
+            append_system_record(
+                self.paths, "operator_granted",
+                "{}'s operator delegation moved to {} with the rename".format(member_name, member.name),
+                to=["all"], socket=socket)
         if member.terminal_id:
             write_pane_record(self.layout.session, member.terminal_id, self.name, member.name, member.generation, member.session)
         append_system_record(self.paths, "renamed", "{} is now {} (old name resolves for 10 min)".format(member_name, new_name), to=["all"], socket=socket)

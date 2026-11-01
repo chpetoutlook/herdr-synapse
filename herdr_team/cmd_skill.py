@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from herdr_team import SKILL_VERSION, paths
+from herdr_team import platform_compat as _platform_compat
 from herdr_team import cli as _cli
 from herdr_team.cli import emit, read_skill_text
 from herdr_team.errors import EXIT_REFUSED, HerdrTeamError
@@ -182,10 +183,14 @@ class _Plan:
             elif link.exists():
                 os.unlink(link)
             paths.ensure_dir(link.parent, 0o755)
-            os.symlink(os.fspath(self.canonical_dir), os.fspath(link))
-        except OSError as err:
+            # through the product helper, so a machine that cannot create
+            # symlinks is reported in the CLI's own error shape (the raw
+            # WinError 1314 is turned into a typed refusal) - 2026-10-21, W-9.
+            _platform_compat.symlink_or_raise(os.fspath(self.canonical_dir), os.fspath(link))
+        except (OSError, HerdrTeamError) as err:
             self.errors.append("{}: {}".format(link, err))
-            self.skipped.append({"path": os.fspath(link), "reason": "os_error: {}".format(err)})
+            code = getattr(err, "code", "os_error")
+            self.skipped.append({"path": os.fspath(link), "reason": "{}: {}".format(code, err)})
             return
         self.installed.append(dict(entry, state="linked"))
 

@@ -54,6 +54,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Union
@@ -64,11 +65,38 @@ from herdr_team.errors import (
     HerdrTeamError,
     exit_code_for,
 )
+from herdr_team.platform_compat import HerdrChannel, LostPipeError, PipeBusyError
 
 DEFAULT_TIMEOUT_S = 5.0
 PROMPT_TIMEOUT_S = 15.0
 SUBPROCESS_TIMEOUT_S = 3.0
 MAX_LINE_BYTES = 16 * 1024 * 1024
+
+#: The error code for a CONNECTION that was lost, as distinct from a server
+#: that is not running. The Windows named pipe leaves the client's handle
+#: invalid when the server closes the pipe, while the server keeps running:
+#: reporting that as ``server_not_running`` tells the daemon the server is
+#: gone, so it tears the subscription down and rebuilds it, over and over
+#: (measured on 2026-10-21: 313 ``agent.list`` failures and 105 subscription
+#: reconnects against a server that was provably up, with a burst of failed
+#: pane opens on every cycle - 2026-10-21 port fix, W-15).
+CODE_CONNECTION_LOST = "herdr_connection_lost"
+
+#: The error code for a pipe whose every instance is busy: a transient race
+#: for a connection, never a dead server (2026-10-21 port fix, W-15).
+CODE_PIPE_BUSY = "herdr_pipe_busy"
+
+
+class _StaleConnection(Exception):
+    """The pipe died before the request was written.
+
+    ``written == 0`` means nothing reached Herdr, so reconnecting and sending
+    the request again cannot duplicate it (2026-10-21 port fix, W-15).
+    """
+
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
 
 #: Pane-identity variables the daemon must never inherit (plan 4.3 step 1).
 IDENTITY_ENV_VARS = ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID")
@@ -133,24 +161,23 @@ class RunResult:
 
 
 class _Connection:
-    """One socket, one request; a subscription keeps it open."""
+    """One socket, one request; a subscription keeps it open.
+
+    On unix this is an ``AF_UNIX`` stream socket. On Windows the Herdr
+    server listens on a Win32 named pipe whose name is the socket path
+    verbatim (``herdr_team.platform_compat``), and the line-JSON protocol
+    is unchanged.
+    """
 
     def __init__(self, socket_path: Path, timeout: Optional[float]) -> None:
         self.socket_path = socket_path
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(timeout)
         try:
-            self.sock.connect(os.fspath(socket_path))
-        except (FileNotFoundError, ConnectionRefusedError, PermissionError, socket.timeout, TimeoutError) as err:
-            self.sock.close()
-            raise HerdrTeamError(
-                "server_not_running",
-                "cannot connect to Herdr at {}: {}".format(socket_path, err),
-                EXIT_UNREACHABLE,
-                {"socket": os.fspath(socket_path)},
-            )
-        except OSError as err:
-            self.sock.close()
+            self.sock = HerdrChannel(socket_path, timeout)
+        except PipeBusyError:
+            # Not a dead server: the pipe exists but every instance is busy.
+            # The caller retries after a moment (2026-10-21 port fix, W-15).
+            raise
+        except (FileNotFoundError, ConnectionRefusedError, PermissionError, socket.timeout, TimeoutError, OSError) as err:
             raise HerdrTeamError(
                 "server_not_running",
                 "cannot connect to Herdr at {}: {}".format(socket_path, err),
@@ -165,6 +192,19 @@ class _Connection:
             self.sock.sendall(data)
         except (socket.timeout, TimeoutError):
             raise HerdrTeamError("herdr_timeout", "timed out sending to Herdr", EXIT_UNREACHABLE, {"socket": os.fspath(self.socket_path)})
+        except LostPipeError as err:
+            # The pipe died. If nothing was written the request never reached
+            # Herdr, so the caller may reconnect and send it again; if bytes
+            # went out, the request may have been processed, and the caller
+            # must not repeat it (2026-10-21 port fix, W-15).
+            if getattr(err, "written", 0) == 0:
+                raise _StaleConnection(err)
+            raise HerdrTeamError(
+                CODE_CONNECTION_LOST,
+                "the Herdr connection was lost while sending: {}".format(err),
+                EXIT_UNREACHABLE,
+                {"socket": os.fspath(self.socket_path)},
+            )
         except OSError as err:
             raise HerdrTeamError("server_not_running", "Herdr connection failed: {}".format(err), EXIT_UNREACHABLE)
 
@@ -191,6 +231,16 @@ class _Connection:
             raw = self._read_raw_line()
         except (socket.timeout, TimeoutError):
             raise HerdrTeamError("herdr_timeout", "timed out waiting for Herdr ({})".format(method), EXIT_UNREACHABLE, {"method": method})
+        except LostPipeError as err:
+            # The pipe died while the answer was coming. The request was
+            # already sent, so it is not repeated - the condition is named
+            # instead (2026-10-21 port fix, W-15).
+            raise HerdrTeamError(
+                CODE_CONNECTION_LOST,
+                "the Herdr connection was lost while waiting for the answer: {}".format(err),
+                EXIT_UNREACHABLE,
+                {"method": method},
+            )
         except OSError as err:
             raise HerdrTeamError("server_not_running", "Herdr connection failed: {}".format(err), EXIT_UNREACHABLE, {"method": method})
         if not raw:
@@ -255,10 +305,19 @@ class HerdrApi:
     def request_raw(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None) -> Dict[str, Any]:
         """Send one request, return the full response object (``id`` plus ``result`` or ``error``)."""
         request_id = next_request_id(self.id_prefix)
-        conn = _Connection(self.socket_path, self.timeout if timeout is None else timeout)
+        conn = self._connect(timeout)
         try:
-            conn.send({"id": request_id, "method": method, "params": params if params is not None else {}})
-            response = conn.read_line(method)
+            try:
+                conn.send({"id": request_id, "method": method, "params": params if params is not None else {}})
+                response = conn.read_line(method)
+            except _StaleConnection:
+                # The pipe died before the request went out: reconnect and
+                # send it once more. Nothing reached Herdr, so this cannot
+                # duplicate anything (2026-10-21 port fix, W-15).
+                conn.close()
+                conn = self._connect(timeout)
+                conn.send({"id": request_id, "method": method, "params": params if params is not None else {}})
+                response = conn.read_line(method)
         finally:
             conn.close()
         if response is None:
@@ -268,13 +327,47 @@ class HerdrApi:
     def request(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None) -> Dict[str, Any]:
         """Send one request and return ``result``; server errors raise ``HerdrTeamError``."""
         request_id = next_request_id(self.id_prefix)
-        conn = _Connection(self.socket_path, self.timeout if timeout is None else timeout)
+        conn = self._connect(timeout)
         try:
-            conn.send({"id": request_id, "method": method, "params": params if params is not None else {}})
-            response = conn.read_line(method)
+            try:
+                conn.send({"id": request_id, "method": method, "params": params if params is not None else {}})
+                response = conn.read_line(method)
+            except _StaleConnection:
+                # The pipe died before the request went out: reconnect and
+                # send it once more. Nothing reached Herdr, so this cannot
+                # duplicate anything (2026-10-21 port fix, W-15).
+                conn.close()
+                conn = self._connect(timeout)
+                conn.send({"id": request_id, "method": method, "params": params if params is not None else {}})
+                response = conn.read_line(method)
         finally:
             conn.close()
         return _check_response(response, request_id, method)
+
+    def _connect(self, timeout: Optional[float]) -> _Connection:
+        """One connection to Herdr.
+
+        A connect failure means the server is not running - except when the
+        pipe is merely BUSY: the server allows a limited number of pipe
+        instances and the daemon opens one per request, so the open can lose
+        the race. That is transient, so it is retried for a moment before it
+        is reported, and it is never reported as a dead server
+        (2026-10-21 port fix, W-15).
+        """
+        budget = self.timeout if timeout is None else timeout
+        deadline = time.monotonic() + min(2.0, max(0.2, float(budget)))
+        while True:
+            try:
+                return _Connection(self.socket_path, budget)
+            except PipeBusyError as err:
+                if time.monotonic() >= deadline:
+                    raise HerdrTeamError(
+                        CODE_PIPE_BUSY,
+                        "every Herdr pipe instance is busy: {}".format(err),
+                        EXIT_UNREACHABLE,
+                        {"socket": os.fspath(self.socket_path)},
+                    )
+                time.sleep(0.05)
 
     def ping(self, timeout: Optional[float] = None) -> Dict[str, Any]:
         """``{"type":"pong","version":"0.8.2","protocol":20,...}``."""
@@ -295,7 +388,7 @@ class HerdrApi:
         """
         subs = normalize_subscriptions(subscriptions)
         request_id = next_request_id(self.id_prefix)
-        conn = _Connection(self.socket_path, self.timeout if connect_timeout is None else connect_timeout)
+        conn = self._connect(connect_timeout)
         try:
             conn.send({"id": request_id, "method": "events.subscribe", "params": {"subscriptions": subs}})
             ack = _check_response(conn.read_line("events.subscribe"), request_id, "events.subscribe")

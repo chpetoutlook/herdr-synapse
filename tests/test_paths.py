@@ -2,11 +2,24 @@ import hashlib
 import os
 import stat
 import unittest
+
+
+def requires_posix_semantics(reason: str) -> None:
+    """Skip a test that needs POSIX-only filesystem semantics.
+
+    Windows has no POSIX mode bits, and creating a symlink there needs a
+    privilege (developer mode or an administrator), so the assertions about
+    ``0o600``/``0o700`` and about symlinked paths cannot hold. The unix
+    behaviour they protect is unchanged (2026-10-21 port fix).
+    """
+    if os.name == "nt":
+        raise unittest.SkipTest(reason)
+
 from pathlib import Path
 
 from herdr_team import paths
 from herdr_team.errors import HerdrTeamError
-from support import TempState
+from support import assert_mode, symlink_or_skip, TempState
 
 
 class SocketResolutionTests(unittest.TestCase):
@@ -73,10 +86,11 @@ class SocketResolutionTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "session_name_invalid")
 
     def test_canonicalizes_symlinked_socket_dir(self):
+        requires_posix_semantics("symlinks need a privilege on Windows")
         real_dir = self.ts.tmp / "real"
         real_dir.mkdir()
         link = self.ts.tmp / "link"
-        os.symlink(real_dir, link)
+        symlink_or_skip(real_dir, link)
         res = paths.resolve_socket(dict(self.base_env, HERDR_SOCKET_PATH=os.fspath(link / "herdr.sock")))
         self.assertEqual(res.path, Path(os.path.realpath(real_dir)) / "herdr.sock")
 
@@ -94,10 +108,22 @@ class SlugTests(unittest.TestCase):
         self.assertEqual(paths.session_slug(p), expected)
 
     def test_config_dir_for_socket(self):
-        # /nonexistent avoids macOS realpath mapping /tmp to /private/tmp
-        self.assertEqual(paths.config_dir_for_socket("/nonexistent/cfg/herdr/herdr.sock"), Path("/nonexistent/cfg/herdr"))
-        self.assertEqual(paths.config_dir_for_socket("/nonexistent/cfg/herdr-dev/sessions/x/herdr.sock"), Path("/nonexistent/cfg/herdr-dev"))
-        self.assertEqual(paths.config_dir_for_socket("/nonexistent/custom/api.sock"), Path("/nonexistent/custom"))
+        # /nonexistent avoids macOS realpath mapping /tmp to /private/tmp.
+        # The shape of the path is platform-native: on Windows a leading "/"
+        # is drive-relative, so the same literal would mean something else.
+        root = "C:/nonexistent" if os.name == "nt" else "/nonexistent"
+        self.assertEqual(
+            paths.config_dir_for_socket(root + "/cfg/herdr/herdr.sock"),
+            Path(root + "/cfg/herdr"),
+        )
+        self.assertEqual(
+            paths.config_dir_for_socket(root + "/cfg/herdr-dev/sessions/x/herdr.sock"),
+            Path(root + "/cfg/herdr-dev"),
+        )
+        self.assertEqual(
+            paths.config_dir_for_socket(root + "/custom/api.sock"),
+            Path(root + "/custom"),
+        )
 
 
 class StateRootTests(unittest.TestCase):
@@ -123,7 +149,9 @@ class StateRootTests(unittest.TestCase):
         paths.write_pointer(self.config, target)
         pointer = paths.pointer_file(self.config)
         self.assertTrue(pointer.is_file())
-        self.assertEqual(stat.S_IMODE(pointer.stat().st_mode), 0o600)
+        if os.name != "nt":
+            # POSIX mode bits only: Windows has no equivalent (2026-10-21 port fix).
+            assert_mode(pointer, 0o600)
         self.assertEqual(paths.read_pointer(self.config), target)
         res = paths.resolve_state_root(self.env, self.config)
         self.assertEqual((res.source, res.path), (paths.STATE_SOURCE_POINTER, target))
@@ -136,11 +164,12 @@ class StateRootTests(unittest.TestCase):
         self.assertEqual(paths.resolve_state_root(self.env, self.config).source, paths.STATE_SOURCE_XDG)
 
     def test_symlinked_pointer_refused(self):
+        requires_posix_semantics("symlinks need a privilege on Windows")
         pointer = paths.pointer_file(self.config)
         pointer.parent.mkdir(parents=True)
         real = self.ts.tmp / "real-pointer"
         real.write_text("/x\n")
-        os.symlink(real, pointer)
+        symlink_or_skip(real, pointer)
         with self.assertRaises(HerdrTeamError) as ctx:
             paths.read_pointer(self.config)
         self.assertEqual(ctx.exception.code, "path_symlink")
@@ -306,12 +335,13 @@ class LayoutTests(unittest.TestCase):
             self.ts.team.human_cursor("a/b")
 
     def test_dir_modes_and_symlink_refusal(self):
+        requires_posix_semantics("POSIX mode bits and symlink refusal")
         for d in self.ts.session.directories() + self.ts.team.directories():
-            self.assertEqual(stat.S_IMODE(d.stat().st_mode), 0o700, d)
+            assert_mode(d, 0o700)
         victim = self.ts.tmp / "victim"
         victim.mkdir()
         link = self.ts.session.root / "teams" / "evil"
-        os.symlink(victim, link)
+        symlink_or_skip(victim, link)
         with self.assertRaises(HerdrTeamError) as ctx:
             paths.ensure_dir(link)
         self.assertEqual(ctx.exception.code, "path_symlink")
@@ -325,10 +355,11 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "path_not_directory")
 
     def test_ensure_dir_creates_nested_with_mode(self):
+        requires_posix_semantics("POSIX mode bits")
         target = self.ts.tmp / "a" / "b" / "c"
         paths.ensure_dir(target)
         for d in (target, target.parent, target.parent.parent):
-            self.assertEqual(stat.S_IMODE(d.stat().st_mode), 0o700)
+            assert_mode(d, 0o700)
 
 
 class AllowedSocketsTests(unittest.TestCase):

@@ -72,6 +72,7 @@ from herdr_team import canvas_render as _render
 from herdr_team import canvas_text as _ctext
 from herdr_team import canvas_theme as _theme
 from herdr_team import features as _features
+from herdr_team import platform_compat as _compat
 from herdr_team import sanitize as _sanitize
 from herdr_team import store
 from herdr_team.canvas_kinds import _common as _kc
@@ -719,7 +720,7 @@ def _events_backwards(team: TeamPaths, chunk: int = 65536) -> Iterator[Dict[str,
         carry: List[bytes] = []
         while pos > 0:
             start = max(0, pos - chunk)
-            block = os.pread(fd, pos - start, start)
+            block = _compat.read_at(fd, pos - start, start)
             pos = start
             if pos > 0 and b"\n" not in block:
                 carry.append(block)

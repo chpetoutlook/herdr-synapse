@@ -12,7 +12,8 @@ import os
 import unittest
 from unittest import mock
 
-from herdr_team import charter as _charter
+from herdr_team import charter as _charter, identity
+from herdr_team import platform_compat as _compat
 from herdr_team import identity, operator, roster, store
 from herdr_team.errors import HerdrTeamError
 from support import FakeApi, TempState, fake_agent
@@ -35,7 +36,7 @@ def api_with_panes(inside_agent_pane: bool) -> FakeApi:
     def process_info(params):
         if params["pane_id"] == AGENT_PANE["pane_id"] and inside_agent_pane:
             # our own pid is in the pane's foreground processes: we are its child
-            return {"process_info": {"shell_pid": os.getpid(), "foreground_process_group_id": os.getpgrp(),
+            return {"process_info": {"shell_pid": os.getpid(), "foreground_process_group_id": identity.own_pgrp(),
                                      "foreground_processes": [{"pid": os.getpid()}]}}
         return {"process_info": {"shell_pid": 1, "foreground_process_group_id": 1, "foreground_processes": []}}
 
@@ -55,6 +56,10 @@ class EscalationTests(unittest.TestCase):
         env = self.state.env_with(HERDR_PANE_ID=None)
         author = self.resolve(env, api_with_panes(inside_agent_pane=True))
         # the process tree still says which pane this is, so the member gets its own name back
+        # The process tree still says which pane this is, so the member gets
+        # its own name back - on Windows too, since W-44 gave the platform a
+        # process table (CreateToolhelp32Snapshot) and the tree is now the
+        # guard there as well (2026-10-22).
         self.assertEqual(author.name, "alpha-reviewer")
         self.assertFalse(author.is_human)
         self.assertEqual(author.origin.get("rerouted"), "no HERDR_PANE_ID")
@@ -114,7 +119,13 @@ class EscalationTests(unittest.TestCase):
         self.assertIsNone(identity.hosting_agent_pane(api))
 
     def test_no_ps_table_is_also_inconclusive(self):
-        with mock.patch.object(identity, "ps_table", lambda: None):
+        # "No process table => the resolver cannot place a process."  On unix
+        # the table is ``identity.ps_table``; on Windows it is
+        # ``platform_compat.process_table`` (CreateToolhelp32Snapshot, W-44),
+        # so both are taken away - otherwise the test would pass on Windows
+        # for the wrong reason.
+        with mock.patch.object(identity, "ps_table", lambda: None), \
+                mock.patch.object(_compat, "process_table", lambda: ({}, {})):
             self.assertIsNone(identity.hosting_agent_pane(api_with_panes(inside_agent_pane=True)))
 
 
@@ -258,7 +269,13 @@ class OperatorCommandTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("member_not_found", err)
 
-    def test_a_delegate_cannot_pass_its_authority_on(self):
+    def test_a_delegate_may_hand_its_authority_on_inside_its_own_team(self):
+        """The team runs without the operator in the loop.
+
+        A delegate that cannot appoint a manager, or empower a seat to rule,
+        is a delegate that still needs the operator. The grant records who
+        passed it on, and every use is audited.
+        """
         from herdr_team import cmd_roster
         from herdr_team.identity import Author
 
@@ -267,9 +284,23 @@ class OperatorCommandTests(unittest.TestCase):
         delegate.operator = True
         # the ordinary gate lets it through ...
         cmd_roster._human_only(self.state.layout, self.state.team_name, delegate, "knowledge set")
-        # ... and the one that hands out authority does not
+        # ... and so does handing the authority on inside its own team
+        cmd_roster._strictly_human(self.state.layout, self.state.team_name, delegate,
+                                   "operator grant", scope="team")
+        cmd_roster._strictly_human(self.state.layout, self.state.team_name, delegate,
+                                   "manager --operator", scope="team")
+
+    def test_a_delegate_cannot_pass_its_authority_outside_its_own_team(self):
+        """Naming a superuser pane is a session-wide act: it stays the operator's."""
+        from herdr_team import cmd_roster
+        from herdr_team.identity import Author
+
+        operator.grant(self.state.session, self.state.team_name, self.member, ttl_s=0)
+        delegate = Author(self.member, "codex", identity.VIA_CLI, True, team=self.state.team_name)
+        delegate.operator = True
         with self.assertRaises(HerdrTeamError) as caught:
-            cmd_roster._strictly_human(self.state.layout, self.state.team_name, delegate, "operator grant")
+            cmd_roster._strictly_human(self.state.layout, self.state.team_name, delegate,
+                                       "superuser designate", scope="session")
         self.assertEqual(caught.exception.code, "author_mismatch")
 
 

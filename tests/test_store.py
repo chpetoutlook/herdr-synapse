@@ -12,7 +12,7 @@ from pathlib import Path
 
 from herdr_team import store
 from herdr_team.errors import HerdrTeamError, LockTimeout
-from support import PLUGIN_ROOT, TempState
+from support import PLUGIN_ROOT, TempState, assert_mode, requires_posix, symlink_or_skip
 
 
 class AtomicWriteTests(unittest.TestCase):
@@ -24,14 +24,14 @@ class AtomicWriteTests(unittest.TestCase):
         target = self.ts.team.root / "x.json"
         store.atomic_write(target, b"hello")
         self.assertEqual(target.read_bytes(), b"hello")
-        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        assert_mode(target, 0o600)
         leftovers = [p for p in self.ts.team.root.iterdir() if p.name.startswith(".tmp-")]
         self.assertEqual(leftovers, [])
 
     def test_atomic_write_creates_parent(self):
         target = self.ts.team.root / "deep" / "x"
         store.atomic_write(target, b"1")
-        self.assertEqual(stat.S_IMODE(target.parent.stat().st_mode), 0o700)
+        assert_mode(target.parent, 0o700)
 
     def test_write_and_read_json(self):
         target = self.ts.session.who_json
@@ -46,7 +46,7 @@ class AtomicWriteTests(unittest.TestCase):
         real = self.ts.tmp / "real.json"
         real.write_text("{}")
         link = self.ts.team.root / "link.json"
-        os.symlink(real, link)
+        symlink_or_skip(real, link)
         with self.assertRaises(HerdrTeamError) as ctx:
             store.atomic_write(link, b"x")
         self.assertEqual(ctx.exception.code, "path_symlink")
@@ -62,7 +62,7 @@ class AtomicWriteTests(unittest.TestCase):
             fh.write(b'{"seq":2}')  # torn tail without newline
         store.append_line(path, b'{"seq":3}\n')
         self.assertEqual(path.read_bytes(), b'{"seq":1}\n{"seq":2}\n{"seq":3}\n')
-        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        assert_mode(path, 0o600)
 
 
 def _hold_lock_in_child(lock_path, hold_s, ready):
@@ -89,7 +89,7 @@ class LockTests(unittest.TestCase):
             self.assertTrue(lock.held)
             self.assertIs(lock.acquire(), lock)
         self.assertFalse(lock.held)
-        self.assertEqual(stat.S_IMODE(self.ts.team.team_lock.stat().st_mode), 0o600)
+        assert_mode(self.ts.team.team_lock, 0o600)
 
     def test_team_lock_refuses_a_missing_team_dir(self):
         """A dissolved team's dir must not come back as a lock-only ``teams/<team>/`` (live RS-10 finding)."""
@@ -148,6 +148,8 @@ class LockTests(unittest.TestCase):
 
     def test_lock_survives_detach_sequence(self):
         """BD-10: a lock taken after fd cleanup stays held; one taken before closerange is lost."""
+        requires_posix("the detach sequence is a POSIX flock behaviour (fcntl); "
+                       "the Windows lock is an msvcrt byte-range lock with no fd inheritance")
         script = r"""
 import os, sys, time, fcntl
 sys.path.insert(0, sys.argv[1])
@@ -175,7 +177,7 @@ time.sleep(float(sys.argv[3]))
     def test_lock_symlink_refused(self):
         real = self.ts.tmp / "real.lock"
         real.write_text("")
-        os.symlink(real, self.ts.team.team_lock)
+        symlink_or_skip(real, self.ts.team.team_lock)
         with self.assertRaises(HerdrTeamError) as ctx:
             store.team_lock(self.ts.team).acquire()
         self.assertEqual(ctx.exception.code, "path_symlink")
@@ -204,7 +206,7 @@ class RosterStoreTests(unittest.TestCase):
             updated = rs.update(mutate)
             self.assertEqual(updated["revision"], before + 2)
             self.assertEqual(rs.load()["naming"], "plain")
-            self.assertEqual(oct(ts.team.team_json.stat().st_mode & 0o777), oct(0o600))
+            assert_mode(ts.team.team_json, 0o600)
 
     def test_save_refuses_a_moved_revision(self):
         with TempState() as ts:

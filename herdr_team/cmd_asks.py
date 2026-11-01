@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from herdr_team import asks as _asks
+from herdr_team import paths as _paths
 from herdr_team import store
 from herdr_team.cli import Command, api_for, emit, layout_for
 from herdr_team.errors import EXIT_OK, EXIT_REFUSED, HerdrTeamError
@@ -36,6 +37,12 @@ MAX_REPLY_CHARS = 500
 #: into -- and Enter here files an answer an agent will act on. Nothing but
 #: leaving is accepted until this has passed; reading the ask takes longer.
 ARM_S = 1.5
+#: How long the console holds the line that says it answered. An
+#: acknowledgement CLOSES the console - the ask list empties and the loop
+#: ends - so a successful Ctrl-A used to look exactly like a quit. The line is
+#: the difference between the two, and it has to be readable before the pane
+#: goes (2026-10-21, W-23).
+ANSWER_NOTICE_S = 1.5
 
 #: What an acknowledgement says. It is deliberately not "ok": an agent that
 #: asked whether to submit something must not read "seen" as approval, and this
@@ -119,10 +126,23 @@ def ask_lines(model: AskModel, now: Optional[float] = None) -> List[str]:
     lines.append("")
     lines.append("> " + model.input if model.armed else "…")
     lines.append("")
-    lines.append("Enter replies · Ctrl-A acknowledges · Tab next · Esc leaves it waiting · q closes")
+    lines.append("Enter replies · Ctrl-A acknowledges and says so · Tab next · Esc leaves it waiting · q closes")
     if model.status:
         lines.append(model.status[:width])
     return lines
+
+
+def answer_notice(intent: Intent) -> str:
+    """The line the console shows when it answered.
+
+    The answer is on the board, and the console has to SAY so: an
+    acknowledgement CLOSES the console, because the ask list empties and the
+    loop ends, so a successful Ctrl-A is indistinguishable from a quit unless
+    the console says what it did (2026-10-21, W-23).
+    """
+    seq = intent.args.get("seq")
+    verb = "acknowledged" if intent.kind == "ack" else "answered"
+    return "answered: #{} is {} on the board".format(seq, verb)
 
 
 def ask_key(model: AskModel, key: str) -> Intent:
@@ -243,9 +263,33 @@ def _loop(stdscr: Any, args: argparse.Namespace, team: str, team_paths: Any) -> 
                 model.status = "not sent: {}".format(err.get("message") or err.get("code"))
                 continue
             model.input = ""
+            # The console SAYS that it answered. Without this an
+            # acknowledgement closes the console - the ask list empties and
+            # the loop ends - so it looked exactly like a quit, and the
+            # operator could not tell that the answer was on the board
+            # (2026-10-21, W-23).
+            model.status = answer_notice(intent)
             _refresh(model, team_paths)
             if not model.asks:
+                _announce(stdscr, model)
                 return EXIT_OK
+
+
+def _announce(stdscr: Any, model: AskModel) -> None:
+    """Hold the line that says the answer is on the board, then let the pane go.
+
+    The console closes the moment the ask list empties, and a pane that
+    vanishes without a word is a pane the operator cannot read as an answer.
+    So the line is drawn and held for a beat before the process ends
+    (2026-10-21, W-23).
+    """
+    from herdr_team.console import draw_lines
+
+    height, width = stdscr.getmaxyx()
+    model.height, model.width = height, width
+    draw_lines(stdscr, ask_lines(model)[: max(1, height)], None, None)
+    stdscr.refresh()
+    time.sleep(ANSWER_NOTICE_S)
 
 
 def _add_pane_arguments(parser: argparse.ArgumentParser) -> None:
@@ -258,8 +302,9 @@ def _run_pane(args: argparse.Namespace) -> int:
 
     env = dict(args.env)
     layout = layout_for(args)
-    if env.get("HERDR_PLUGIN_ENTRYPOINT_ID") != ENTRYPOINT and not getattr(args, "force", False):
+    if not _paths.entrypoint_matches(env, ENTRYPOINT) and not getattr(args, "force", False):
         raise HerdrTeamError("not_a_plugin_pane", "asks-pane runs in the asks popup; use `herdr-synapse asks` or pass --force", EXIT_REFUSED)
+    _paths.require_vendor_curses(env)
     if not _paths.socket_allowed(layout.config_dir, layout.socket):
         sys.stderr.write("herdr-synapse asks-pane skipped: socket not allowed\n")
         return EXIT_OK

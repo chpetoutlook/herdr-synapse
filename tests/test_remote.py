@@ -16,7 +16,7 @@ import urllib.parse
 from unittest import mock
 
 from herdr_team import asks, cmd_asks, cmd_board, identity, remote, store
-from support import FakeApi, TempState, wait_until
+from support import assert_mode, FakeApi, symlink_or_skip, TempState, wait_until
 from test_cmd_roster import json_out, live_api, run_cli
 from test_daemon import make_daemon
 
@@ -333,8 +333,8 @@ class PairingTests(CliCase):
         self.assertTrue(out["receives"])
         self.assertFalse(out["outbound_only"])
         path = remote.config_path(self.ts.config_dir)
-        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(path.parent).st_mode), 0o700)
+        assert_mode(path, 0o600)
+        assert_mode(path.parent, 0o700)
         self.assertEqual(self.config()["ntfy"]["token"], NTFY_TOKEN)
         self.assertNotIn(NTFY_TOKEN, json.dumps(out))
 
@@ -434,7 +434,7 @@ class PairingTests(CliCase):
         target.write_text("{}")
         path = remote.config_path(self.ts.config_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(target, path)
+        symlink_or_skip(target, path)
         code, _out, err = self.cli("status")
         self.assertEqual((code, err["code"]), (1, "path_symlink"))
 

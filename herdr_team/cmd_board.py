@@ -32,6 +32,7 @@ from herdr_team import gate as _gate
 from herdr_team import identity as _identity
 from herdr_team import links as _links
 from herdr_team import paths as _paths
+from herdr_team import platform_compat as _compat
 from herdr_team import render as _render
 from herdr_team import roster as _roster
 from herdr_team import sanitize as _sanitize
@@ -143,7 +144,8 @@ def env_of(args: argparse.Namespace) -> Dict[str, str]:
 
 
 def cli_path() -> str:
-    return os.fspath(_paths.plugin_root() / "bin" / "herdr-synapse")
+    """The launcher path a human can run on THIS platform (Windows: the .cmd)."""
+    return os.fspath(_paths.cli_launcher_path())
 
 
 # --------------------------------------------------------------------------
@@ -406,15 +408,8 @@ def live_console_entries(session: SessionPaths, alive: Any = None) -> Dict[str, 
 def _pid_is_alive(pid: Any) -> bool:
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+    # Windows note: ``os.kill(pid, 0)`` would terminate the process there.
+    return _compat.pid_alive(pid)
 
 
 def update_console_doc(session: SessionPaths, mutate: Any) -> Dict[str, Any]:
@@ -506,15 +501,8 @@ def process_start_time(pid: int) -> Optional[str]:
 def pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+    # Windows note: ``os.kill(pid, 0)`` would terminate the process there.
+    return _compat.pid_alive(pid)
 
 
 def daemon_status(session: SessionPaths) -> Dict[str, Any]:
@@ -826,7 +814,18 @@ def resolve_author(args: argparse.Namespace, layout: Layout, api: Any, team: Opt
     explicit = team is None or _paths.team_name_from_arg(getattr(args, "team", None), env) is not None
     author = _identity.resolve_author(env, layout, api, team=team, as_human=as_human, relayed_for=relayed_for, label=label, require_server=require_server, team_explicit=explicit)
     if author.reason and not author.verified and author.via != VIA_OUTSIDE:
-        warn(args, "author unverified: {}".format(author.reason))
+        reason = author.reason
+        if "Herdr unreachable" in reason:
+            # The server could not be reached, so the author could not be
+            # verified. That is a CONDITION, not a note: the command reports
+            # it as a JSON error naming it instead of a prose warning
+            # (2026-10-21 port fix, W-15).
+            raise HerdrTeamError(
+                "herdr_unreachable",
+                "Herdr is unreachable, so the author could not be verified: {}".format(reason),
+                EXIT_UNREACHABLE,
+            )
+        warn(args, "author unverified: {}".format(reason))
     return author
 
 
@@ -1080,7 +1079,33 @@ def mention_hint(doc: Dict[str, Any], text: str, to: Sequence[str]) -> Optional[
             "Use --to {name} to reach {name} alone (@name targets in the console, not in a post).".format(name=name))
 
 
-def resolve_recipients(doc: Dict[str, Any], to_args: Optional[List[str]], author: Author, to_any: bool = False) -> Tuple[List[str], Optional[str]]:
+
+def _superuser_agents(doc: Dict[str, Any]) -> List[str]:
+    """Return list of superuser agent names from the roster."""
+    return [str(m.get('name')) for m in role_holders(doc, 'superuser')]
+
+
+def _forward_seats(doc: Dict[str, Any]) -> List[str]:
+    """The seats a member's request to the operator is forwarded to.
+
+    The manager assigns and gives the verdicts; the lead rules. A member that
+    asks the operator for a review or for work is asking the seats that can
+    give it, so the request goes to them as well: the operator stays the
+    escalator, never the queue.
+    """
+    out: List[str] = []
+    for member in agent_members(doc):
+        name = str(member.get("name") or "")
+        if not name:
+            continue
+        wanted = bool(member.get("manager")) or str(member.get("role") or "") == "lead"
+        if wanted and name not in out:
+            out.append(name)
+    return out
+
+
+def resolve_recipients(doc: Dict[str, Any], to_args: Optional[List[str]], author: Author, to_any: bool = False,
+                       kind: Optional[str] = None) -> Tuple[List[str], Optional[str]]:
     """Expand ``--to`` against the roster; ``role:<r>`` records ``to_role``."""
     roster_names = [m.get("name") for m in agent_members(doc)]
     if not to_args:
@@ -1095,8 +1120,18 @@ def resolve_recipients(doc: Dict[str, Any], to_args: Optional[List[str]], author
     out: List[str] = []
     to_role: Optional[str] = None
     for entry in entries:
-        if entry in ("all", AUTHOR_HUMAN):
-            target = [entry]
+        if entry == "all":
+            target = ["all"]
+        elif entry in (AUTHOR_HUMAN, "operator"):
+            # Auto-forward to superuser: always include superuser agents when human/operator is targeted
+            superuser_agents = _superuser_agents(doc)
+            target = [AUTHOR_HUMAN] + [sa for sa in superuser_agents if sa not in out]
+            if author.is_member and kind in ("question", "request", "blocked"):
+                # A member's request for a review or for work is forwarded to the
+                # seats that can give it, so the operator is never the queue.
+                for seat in _forward_seats(doc):
+                    if seat not in target:
+                        target.append(seat)
         elif entry.startswith("role:"):
             role = entry[len("role:"):]
             holders = [str(m.get("name")) for m in role_holders(doc, role)]
@@ -1216,7 +1251,7 @@ def _run_post(args: argparse.Namespace) -> int:
         note = _identity.ignored_label_note(author)
         if note:
             warn(args, note)
-    to, to_role = resolve_recipients(doc, args.to, author, args.to_any)
+    to, to_role = resolve_recipients(doc, args.to, author, args.to_any, getattr(args, "kind", None))
     link_target = next((t for t in to if _links.is_team_recipient(t)), None)
     interrupt = bool(getattr(args, "interrupt", False))
     if link_target is not None:
@@ -1246,6 +1281,16 @@ def _run_post(args: argparse.Namespace) -> int:
 
     try:
         seq = board_append(team, record, spill_text=body, attachments=staged)
+    except HerdrTeamError as err:
+        # A write that did not land leaves NO trace on the board: the seq is
+        # allocated at write time and reused, so there are no gaps to count -
+        # and the CLI audit trail did not record it either, so a lost post was
+        # invisible to everyone but the sender. The trail says it now, with the
+        # code that named the failure (2026-10-21 port fix, W-16).
+        store.BoardStore(team).discard_staged(staged)
+        _identity.audit(layout, team_name, "post_write_failed", author,
+                        {"code": err.code, "kind": args.kind, "to": to, "error": err.message})
+        raise
     except BaseException:
         store.BoardStore(team).discard_staged(staged)
         raise
@@ -1371,6 +1416,10 @@ def _wait_seconds(args: argparse.Namespace, doc: Dict[str, Any], to: List[str], 
     team policy decides, and only for a member asking the operator something:
     the operator's own posts never wait, and neither does a post nobody is
     expected to answer.
+
+    A member the operator delegated to never waits either: they hold the
+    operator's authority for this team, so nobody is going to answer them.
+    They post, the question is on the board, and they carry on.
     """
     from herdr_team.cmd_misc import ask_view
 
@@ -1380,6 +1429,11 @@ def _wait_seconds(args: argparse.Namespace, doc: Dict[str, Any], to: List[str], 
     if author.is_human:
         if explicit:
             raise UsageError("--wait is for members: you are the operator, and nobody else answers a wait")
+        return None
+    if getattr(author, "operator", False):
+        # The operator's own hands: a wait would wait for themselves.
+        if explicit:
+            raise UsageError("--wait is for members the operator has to answer: you hold that authority for this team")
         return None
     if "human" not in to:
         if explicit:
@@ -1590,22 +1644,43 @@ def _run_board(args: argparse.Namespace) -> int:
         max_posts = args.max_posts
         max_bytes = args.max_bytes if args.max_bytes is not None else BOARD_OUTPUT_CAP_BYTES
     truncated = False
+    # Which end a cap cuts from:
+    #  * a WINDOW read (--last) asked for the newest records, so the newest
+    #    survive - a cap that kept the oldest of them answered with a window
+    #    that was not the one asked for (the reviewer measured --last 200
+    #    answering with the oldest 71 of the newest 200, seqs 221..291,
+    #    2026-10-21 port fix, W-16);
+    #  * the UNREAD view (--new) advances the cursor to the last printed seq,
+    #    so the OLDEST survive: dropping the oldest of the unread posts
+    #    would skip posts that were never read.
+    keep_newest = not args.new
     if limit is not None and len(selection) > limit:
-        selection = selection[:limit]
+        selection = selection[-limit:] if keep_newest else selection[:limit]
         truncated = True
     if max_posts is not None and len(selection) > max_posts:
-        selection = selection[:max_posts]
+        selection = selection[-max_posts:] if keep_newest else selection[:max_posts]
         truncated = True
-    # byte cap: keep whole records, oldest first, so the cursor stops at the last printed seq
+    # byte cap: keep whole records. A WINDOW read (--last) asked for the newest
+    # ones, so those are the ones kept when the bytes run out; the order
+    # printed stays oldest first. The --new view keeps the oldest, so the
+    # cursor stops at the last printed seq and nothing unread is skipped
+    # (2026-10-21 port fix, W-16).
+    window = args.last is not None and not args.new
+    ordered = list(reversed(selection)) if window else selection
     shown: List[Dict[str, Any]] = []
     used = 0
-    for record in selection:
+    for record in ordered:
         size = len(json.dumps(record, ensure_ascii=False).encode("utf-8")) + 1
-        if shown and used + size > max_bytes:
+        # A WINDOW read asked for N records: the count caps above already
+        # bound it, and cutting it to the byte cap would answer with a
+        # window that is not the one asked for (2026-10-21 port fix, W-16).
+        if not window and shown and used + size > max_bytes:
             truncated = True
             break
         shown.append(record)
         used += size
+    if window:
+        shown = list(reversed(shown))
     receipts = compute_receipts(team, doc, shown, all_records) if args.receipts else None
     highest = shown[-1]["seq"] if shown else cursor_before
     shown_seqs = {r["seq"] for r in shown}
@@ -1734,17 +1809,23 @@ def wait_for_answer(team: TeamPaths, seq: int, timeout_s: float, poll_s: float =
     wait measured in minutes would do that hundreds of times. The tailer
     ``pread``s only the new bytes from a fd it holds open.
 
-    Only the operator's reply counts. A teammate answering a question is a peer
-    note on the same thread, and taking it as the answer is exactly how a
-    genuine pre-submission halt got overridden on the team this was built for.
+    Only the operator's reply counts, and so does the reply of a member the
+    operator delegated to: they hold the operator's authority for this team.
+    A teammate answering a question is a peer note on the same thread, and
+    taking it as the answer is exactly how a genuine pre-submission halt got
+    overridden on the team this was built for.
     """
     tailer = store.BoardTailer(team, start_seq=seq, persist=False)
     started = clock()
     deadline = started + max(0.0, timeout_s)
     next_beat = started + heartbeat_s
+    try:
+        session = team.session_paths
+    except Exception:  # noqa: BLE001 - an unusual path shape falls back to the operator only
+        session = None
     while True:
         for record in tailer.poll():
-            if _asks.answered_by(record) == seq:
+            if _asks.answered_by(record, session=session, team=team.name) == seq:
                 return record
         now = clock()
         if now >= deadline:

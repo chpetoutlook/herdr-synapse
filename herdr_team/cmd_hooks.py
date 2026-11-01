@@ -12,7 +12,8 @@ passing nonce round trip in ``kinds.json``, and ``hooks_unsupported`` after.
 ``hook-input <session-start|prompt-submit|stop>`` is what the shim calls.
 It reads the Claude hook's stdin JSON, applies the gates (subagent input
 with ``agent_id``/``agent_type``, Cursor input, ``HERDR_TEAM_HOOKS=off``),
-resolves the member through one ``pane.get`` (0.5 s) plus the pane index,
+resolves the member through one ``pane.get`` of ``PANE_GET_TIMEOUT_S`` (measured,
+see the bound below) plus the pane index,
 and prints the context. On ``stop`` it exits ``EXIT_HOOK_BLOCK`` (7) with the
 block message on stdout; the shim turns that, and only that, into exit 2.
 """
@@ -32,9 +33,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from herdr_team import claude_settings, paths, store
 from herdr_team import charter as _charter
+from herdr_team import identity as _identity
 from herdr_team import instructions_doc as _doc
 from herdr_team import daemon as _daemon
 from herdr_team import hooks as _hooks
+from herdr_team import platform_compat as _compat
 from herdr_team import render as _render
 from herdr_team import roster as _roster
 from herdr_team import cli as _cli
@@ -45,7 +48,40 @@ from herdr_team.errors import EXIT_DAEMON_DOWN, EXIT_OK, EXIT_REFUSED, HerdrTeam
 EXIT_HOOK_BLOCK = 7
 HOOK_ACTIONS = ("session-start", "prompt-submit", "stop")
 KNOWN_KINDS = ("claude", "codex", "opencode", "kimi", "qwen", "cursor", "copilot", "antigravity", "pi", "gemini")
-PANE_GET_TIMEOUT_S = 0.5
+#: The pane.get bound. MEASURED, not chosen, and DERIVED rather than typed, so
+#: the number that matters is the measurement and the bound follows it.
+#:
+#: The measurement was taken on this estate under the estate's own load, with
+#: the fleet running: 8 concurrent workers over three minutes, 90845 samples
+#: across the board's panes - median 1 ms, p90 102 ms, p99 109 ms, and a slow
+#: end of 4.017 s, with 16 samples at or over 1.69 s and 8 at or over 3.32 s.
+#: A single-request window on the same estate never once reached the old
+#: half-second bound (168636 samples, max 215 ms), which is why a bound read
+#: off a quiet machine is a bound nobody can rely on: it has not been asked the
+#: hard question. The slow end to survive is the estate's worst measured, and
+#: the margin is the same shape the drift tolerance uses - a multiple, not a
+#: hand-typed number.
+#:
+#: A BOUND SET FROM A MEASUREMENT IS DATED BY THAT MEASUREMENT, and this
+#: estate's slow end moved three times in one night. So the trail entry that
+#: records the failure is also the signal that the margin is gone: when
+#: ``hook_pane_get_failed`` fires, the bound is RE-MEASURED, not defended.
+#: The entry carries the bound in force, the slow end it was derived from and
+#: the day it was measured, so a reader can see the bound is dated without
+#: hunting for this comment. The member is still resolved from the pane index
+#: when the pane.get does not land, so a slow daemon costs a slower answer,
+#: not a missing one, and the refusal is recorded either way.
+#:
+#: The slow end measured under the estate's own load. This is the number a
+#: future measurement replaces.
+PANE_GET_SLOW_END_S = 8.8
+#: The multiple of the measured slow end the bound is set to.
+PANE_GET_BOUND_MARGIN = 2.0
+#: The bound, derived from the measurement above.
+PANE_GET_TIMEOUT_S = PANE_GET_SLOW_END_S * PANE_GET_BOUND_MARGIN
+#: The day the bound above was measured. Carried on every refusal, so the
+#: trail says which bound was in force and how old it was.
+PANE_GET_BOUND_MEASURED_ON = "2026-10-22"
 STDIN_MAX_BYTES = 1024 * 1024
 CONTEXT_MAX_POSTS = 20
 CONTEXT_MAX_BYTES = 4096
@@ -187,13 +223,13 @@ def _unread_from_offset(team: paths.TeamPaths, name: str) -> List[Dict[str, Any]
         offset = state.get("offset") if isinstance(state.get("offset"), int) and not isinstance(state.get("offset"), bool) else None
         valid = state.get("inode") == st.st_ino and offset is not None and 0 <= offset <= size
         if valid and offset:
-            valid = os.pread(fd, 1, offset - 1) == b"\n"
+            valid = _compat.read_at(fd, 1, offset - 1) == b"\n"
         start = offset if valid and offset is not None else 0
         capped = False
         if size - start > OFFSET_READ_CAP:
             start = size - OFFSET_READ_CAP
             capped = True
-        data = os.pread(fd, max(0, size - start), start) if size > start else b""
+        data = _compat.read_at(fd, max(0, size - start), start) if size > start else b""
     finally:
         os.close(fd)
     if (capped or not valid) and start > 0:
@@ -250,13 +286,54 @@ def _record_hook_seen(layout: paths.Layout, terminal_id: Any, action: str) -> No
 # member resolution for the hook
 
 
-def _pane_info(api: Any, pane_id: str) -> Optional[Dict[str, Any]]:
+def _pane_info(api: Any, pane_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[HerdrTeamError]]:
+    """The pane, and the failure if there was one.
+
+    A pane that is too slow to answer and a pane that does not exist are
+    different facts, and the hook has to be able to say which one it was, so
+    the failure is returned rather than swallowed.
+    """
     try:
         result = api.request("pane.get", {"pane_id": pane_id}, timeout=PANE_GET_TIMEOUT_S)
-    except HerdrTeamError:
-        return None
+    except HerdrTeamError as err:
+        return None, err
     pane = result.get("pane") if isinstance(result, dict) else None
-    return pane if isinstance(pane, dict) else None
+    return (pane if isinstance(pane, dict) else None), None
+
+
+def _record_pane_get_failure(layout: paths.Layout, env: Dict[str, str], pane_id: str,
+                             err: BaseException, member: Optional[Dict[str, Any]]) -> None:
+    """Record a pane.get that did not land, so a refusal is never silent.
+
+    A member that cannot be resolved is still refused - that half does not
+    change - but the thing failed and nobody but the sender could tell, which
+    is the same defect as a lost post: the trail says it now, the way a post
+    write failure is recorded, with the code that named the failure.
+    """
+    team = (member or {}).get("team") or env.get("HERDR_TEAM")
+    name = (member or {}).get("name")
+    author = _identity.Author(name=name or "hook", kind=None, via=_identity.VIA_HOOK,
+                               verified=bool(member))
+    details = {
+        "code": getattr(err, "code", "pane_get_failed"),
+        "error": str(err),
+        "pane_id": pane_id,
+        "member": name,
+        "team": team,
+        "resolved_without_pane_get": bool(member),
+        # The bound in force and the day it was measured. A bound set from a
+        # measurement is dated by that measurement, and this entry firing is
+        # the signal that the margin is gone: the bound is re-measured, not
+        # defended.
+        "bound_s": PANE_GET_TIMEOUT_S,
+        "bound_slow_end_s": PANE_GET_SLOW_END_S,
+        "bound_margin": PANE_GET_BOUND_MARGIN,
+        "bound_measured_on": PANE_GET_BOUND_MEASURED_ON,
+    }
+    try:
+        _identity.audit(layout, team, "hook_pane_get_failed", author, details)
+    except Exception:
+        pass
 
 
 def _member_from_teams(session: paths.SessionPaths, terminal_id: Optional[str], pane_id: Optional[str]) -> Optional[Tuple[str, Dict[str, Any]]]:
@@ -283,7 +360,16 @@ def resolve_hook_member(layout: paths.Layout, api: Any, env: Dict[str, str]) -> 
     pane_id = env.get("HERDR_PANE_ID") or ""
     if not pane_id:
         return None
-    pane = _pane_info(api, pane_id)
+    pane, pane_err = _pane_info(api, pane_id)
+    member = _resolve_hook_member(layout, env, pane_id, pane)
+    if pane_err is not None:
+        _record_pane_get_failure(layout, env, pane_id, pane_err, member)
+    return member
+
+
+def _resolve_hook_member(layout: paths.Layout, env: Dict[str, str], pane_id: str,
+                         pane: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The member for this pane, from the pane info when it arrived and from the pane index when it did not."""
     terminal_id = pane.get("terminal_id") if pane else None
     current_pane = pane.get("pane_id") if pane else pane_id
     session = layout.session
@@ -906,6 +992,11 @@ def _cli_path(args: argparse.Namespace) -> Path:
         return Path(os.path.abspath(os.path.expanduser(args.cli)))
     root = args.env.get("HERDR_TEAM_ROOT")
     base = Path(root) if root else paths.plugin_root()
+    # The shim is a POSIX sh script and tests its target with `[ -x "$cli" ]`,
+    # so it must point at the POSIX launcher - baking a .cmd path into it would
+    # make the shim report "CLI not found" and skip the hook (2026-10-21 port
+    # fix). The human-facing hints use paths.cli_launcher_path() instead, which
+    # names the launcher this platform can run.
     return (base / "bin" / "herdr-synapse").resolve()
 
 

@@ -34,13 +34,14 @@ def prepare(kind: str, name: str, args: Sequence[str]) -> Tuple[List[str], Dict[
     if kind in ("claude", "pi"):
         extra += ["--name", name]
     elif kind == "opencode":
+        # OpenCode v2.1+ uses its own internal server; no --hostname/--port flags.
+        # The TUI starts its own server on a random port. We record the port
+        # for the session record but don't pass CLI flags (unsupported in v2.1+).
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             port = listener.getsockname()[1]
-        # OpenCode's TUI already owns a server. Pin it to a private loopback
-        # endpoint so the plugin can PATCH the reported session, not another UI.
-        extra += ["--hostname", "127.0.0.1", "--port", str(port)]
         entry["port"] = port
+        # No extra CLI args needed; OpenCode manages its own server port.
     return extra, entry
 
 

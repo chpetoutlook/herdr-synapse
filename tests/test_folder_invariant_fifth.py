@@ -57,6 +57,7 @@ import os
 import random
 import re
 import time
+from support import is_root, requires_posix, symlink_or_skip
 import unittest
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -460,13 +461,13 @@ class FifthWorld(X4.FourthWorld):
         rel = self._pull_foreign()
         way = self.rng.choice(ways)
         if way == "inherited/members->members":
-            os.symlink(os.path.join("..", "members"), os.fspath(inherited / "members"))
+            symlink_or_skip(os.path.join("..", "members"), os.fspath(inherited / "members"))
         else:
             if os.path.lexists(os.fspath(inherited)):
                 inherited.rmdir()
             if way != ".":
                 (self.root / way).mkdir(exist_ok=True)
-            os.symlink(way, os.fspath(inherited))
+            symlink_or_skip(way, os.fspath(inherited))
         self.trace[-1] = "git pull delivers {}; inherited is a symlink into the team folder ({}); --force".format(rel, way)
         try:
             self._force(self.trace[-1])
@@ -855,7 +856,7 @@ class FifthVocabularyFindingScriptTests(unittest.TestCase):
             w.ev_move_folder()
         self.assertOraclePasses(self.run_script(script))
 
-    @unittest.skipIf(os.getuid() == 0, "root writes into a read-only directory")
+    @unittest.skipIf(is_root(), "root writes into a read-only directory")
     def test_x5_4_b_a_force_whose_replace_fails_says_why_and_does_not_print_itself_again(self):
         """The team folder is not writable but ``inherited/`` is (it was created later, or by another user). ``project
         render --force`` makes and checks the copy, then ``store.atomic_write`` of the record raises ``PermissionError``,
@@ -863,6 +864,12 @@ class FifthVocabularyFindingScriptTests(unittest.TestCase):
         only), leaves the hold it had ("it changed after this team last wrote it"), prints ``nothing written; 1 file
         held`` with the same ``project render --force`` as the way to resolve it, and exits 0. Run again, it does the
         same. The text never says the folder is not writable."""
+        # A read-only directory is a POSIX shape: Windows has no POSIX mode
+        # bits (chmod only toggles the read-only flag, which a directory
+        # ignores), so the folder cannot be made unwritable there and the
+        # render would succeed - the test would assert a scenario it never
+        # created (2026-10-21 port fix, W-22).
+        requires_posix("a read-only directory needs POSIX mode bits: Windows cannot make a directory unwritable")
         def script(w: ScriptedFifthWorld) -> None:
             w.new_gen(w.project, mode="manual", rules=None)
             w.label("git pull delivers facts.md; render")
@@ -936,7 +943,7 @@ class FifthVocabularyFindingScriptTests(unittest.TestCase):
                     if os.path.lexists(os.fspath(inherited)):
                         inherited.rmdir()
                     (w.root / way).mkdir(exist_ok=True)
-                    os.symlink(way, os.fspath(inherited))
+                    symlink_or_skip(way, os.fspath(inherited))
                     w._force("project render --force")
                     self.assertEqual((w.root / "members/alpha-worker.md").read_bytes(), data)
                 self.assertOraclePasses(self.run_script(script))

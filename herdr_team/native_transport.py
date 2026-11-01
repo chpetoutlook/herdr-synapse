@@ -17,6 +17,9 @@ import urllib.request
 from typing import Any, Dict, Optional, Sequence
 
 
+from herdr_team.platform_compat import IS_WINDOWS, detached_creation_flags, kill_process_group
+
+
 class NativeError(Exception):
     """A stable classification, deliberately excluding native output and secrets."""
 
@@ -25,7 +28,7 @@ def _stop_owned(proc: subprocess.Popen) -> None:
     """Reap our private process group even when its original parent already exited."""
     def send(sig: int) -> None:
         try:
-            os.killpg(proc.pid, sig)
+            kill_process_group(proc.pid, sig)
         except ProcessLookupError:
             pass
         except PermissionError as denied:
@@ -48,28 +51,84 @@ def _stop_owned(proc: subprocess.Popen) -> None:
         pass
     # A surviving grandchild may hold stdout open or ignore TERM after its parent
     # exits. This group was created by us; no pre-existing session is targeted.
-    send(signal.SIGKILL)
+    # The signal is resolved HERE because Windows has no SIGKILL (it is SIGTERM
+    # there), and evaluating ``signal.SIGKILL`` on Windows raises
+    # AttributeError - which is not caught here, so the cleanup would fail
+    # with a traceback instead of reaping the group (2026-10-22, W-46).
+    send(getattr(signal, "SIGKILL", signal.SIGTERM))
     proc.wait(timeout=2)
+
+
+def _owned_flags() -> int:
+    """Windows creation flags for an owned child (0 on unix)."""
+    return detached_creation_flags() if IS_WINDOWS else 0
+
+
+def _read_child_output_windows(proc: subprocess.Popen, deadline: float, cap: int) -> bytes:
+    """Read the child's stdout on Windows, with the deadline and the cap.
+
+    ``selectors`` cannot watch a PIPE on Windows: ``SelectSelector``
+    supports sockets only, so registering the child's stdout raises
+    ``OSError: [WinError 10038] An operation was attempted on something
+    that is not a socket`` - and the command could not read its child at
+    all (measured 2026-10-22, W-47).
+
+    So the read happens on a thread, which is the shape ``JsonLines``
+    already uses on both platforms, and the deadline is enforced by the
+    caller waiting on it.  The same bounds hold: the output is capped, and
+    exceeding the cap is ``native_frame_too_large``.
+    """
+    output = bytearray()
+    too_large = threading.Event()
+    done = threading.Event()
+
+    def reader() -> None:
+        try:
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > cap:
+                    too_large.set()
+                    return
+        except (OSError, ValueError):
+            pass
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not done.wait(remaining):
+        raise NativeError("native_timeout")
+    if too_large.is_set():
+        raise NativeError("native_frame_too_large")
+    return bytes(output)
 
 
 def metadata_command(argv: Sequence[str], cwd: str, env: Dict[str, str], deadline: float) -> str:
     """One native metadata command with an owned process group and a shared deadline."""
     proc = subprocess.Popen(list(argv), cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            start_new_session=not IS_WINDOWS, creationflags=_owned_flags())
     try:
-        output = bytearray()
-        with selectors.DefaultSelector() as selector:
-            selector.register(proc.stdout, selectors.EVENT_READ)
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or not selector.select(remaining):
-                    raise NativeError("native_timeout")
-                chunk = os.read(proc.stdout.fileno(), min(65536, 8 * 1024 * 1024 + 1 - len(output)))
-                if not chunk:
-                    break
-                output.extend(chunk)
-                if len(output) > 8 * 1024 * 1024:
-                    raise NativeError("native_frame_too_large")
+        if IS_WINDOWS:
+            output = _read_child_output_windows(proc, deadline, 8 * 1024 * 1024)
+        else:
+            output = bytearray()
+            with selectors.DefaultSelector() as selector:
+                selector.register(proc.stdout, selectors.EVENT_READ)
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise NativeError("native_timeout")
+                    chunk = os.read(proc.stdout.fileno(), min(65536, 8 * 1024 * 1024 + 1 - len(output)))
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                    if len(output) > 8 * 1024 * 1024:
+                        raise NativeError("native_frame_too_large")
         try:
             proc.wait(timeout=max(.01, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
@@ -91,7 +150,7 @@ class JsonLines:
         self.seq = 0
         self.proc = subprocess.Popen(list(argv), cwd=cwd, env=env, stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                     start_new_session=True)
+                                     start_new_session=not IS_WINDOWS, creationflags=_owned_flags())
         self.closed = threading.Event()
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
@@ -194,7 +253,8 @@ class OpenCodeServer:
                           OPENCODE_DISABLE_EXTERNAL_PLUGINS="true", OPENCODE_DISABLE_AUTOUPDATE="true")
         self.proc = subprocess.Popen([path, "serve", "--hostname", "127.0.0.1", "--port", str(port)],
                                      cwd=cwd, env=native_env, stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     start_new_session=not IS_WINDOWS, creationflags=_owned_flags())
         # Do not honor system proxy settings for this owned loopback connection.
         self.http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.authenticated = False

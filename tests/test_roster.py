@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 from typing import Any, Dict, List
 
-from support import FAKE_AGENTS, FakeApi, FakeError, TempState, fake_agent, identity_tokens
+from support import FAKE_AGENTS, FakeApi, FakeError, TempState, assert_mode, fake_agent, identity_tokens
 
 from herdr_team import roster, store
 from herdr_team.errors import EXIT_REFUSED, HerdrTeamError
@@ -176,7 +176,7 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(team.revision, 1)
             self.assertEqual([m.name for m in team.members], ["human"])
             self.assertEqual(team.socket, os.fspath(ts.layout.socket))
-            self.assertEqual(oct(os.stat(ts.session.team("beta").team_json).st_mode & 0o777), "0o600")
+            assert_mode(ts.session.team("beta").team_json, 0o600)
             with self.assertRaises(HerdrTeamError) as ctx:
                 roster.create_team(ts.layout, "beta")
             self.assertEqual(ctx.exception.code, "team_exists")
@@ -524,6 +524,32 @@ class MemberCrudTests(unittest.TestCase):
             with self.assertRaises(HerdrTeamError) as ctx:
                 rs.adopt_rename("alice", "codex")
             self.assertEqual(ctx.exception.code, "name_reserved")
+
+    def test_adopt_rename_carries_the_operator_delegation_with_it(self) -> None:
+        """A rename must not silently strip the operator authority it holds."""
+        from herdr_team import operator
+
+        with TempState() as ts:
+            operator.grant(ts.session, "alpha", "alpha-reviewer", ttl_s=0, note="granted by the human")
+            rs = roster.Roster(ts.layout, "alpha")
+            rs.adopt_rename("alpha-reviewer", "alice")
+            self.assertIsNone(operator.active(ts.session, "alpha", "alpha-reviewer"))
+            grant = operator.active(ts.session, "alpha", "alice")
+            self.assertIsNotNone(grant)
+            self.assertEqual(grant["note"], "granted by the human")  # type: ignore[index]
+            self.assertIsNone(grant["expires_at"])  # type: ignore[index]
+            self.assertEqual(grant["granted_by"], "human")  # type: ignore[index]
+
+    def test_adopt_rename_leaves_an_existing_target_delegation_alone(self) -> None:
+        """Two names cannot both hold the same delegation; the live one wins."""
+        from herdr_team import operator
+
+        with TempState() as ts:
+            operator.grant(ts.session, "alpha", "alpha-reviewer", ttl_s=0, note="old")
+            operator.grant(ts.session, "alpha", "alice", ttl_s=0, note="new")
+            rs = roster.Roster(ts.layout, "alpha")
+            rs.adopt_rename("alpha-reviewer", "alice")
+            self.assertEqual(operator.active(ts.session, "alpha", "alice")["note"], "new")  # type: ignore[index]
 
 
 class RehydrationTests(unittest.TestCase):

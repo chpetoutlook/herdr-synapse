@@ -116,8 +116,13 @@ def gather(layout: Any, team_filter: Optional[str] = None, now: Optional[float] 
                 lanes["blocked"].append(_card("blocked", team_name, "work", "{} {}".format(item.id, _work.clip(item.title, 80)), item.block_reason or "",
                                               item.owner, None, [CLI, "--team", team_name, "work", "show", item.id], item.updated_at))
             elif item.status == _work.STATUS_IN_REVIEW and "human" in item.review_by:
-                lanes["needs_you"].append(_card("needs_you", team_name, "review", "review {}: {}".format(item.id, _work.clip(item.title, 80)),
-                                                _work.clip(item.summary, 120), item.owner, None,
+                # The verdict belongs to an agent, not to the operator: the card goes to
+                # the manager -- who reviews it, being a named reviewer, or carries it to
+                # the lead -- instead of sitting in the operator's lane forever.
+                lanes["needs_you"].append(_card("needs_you", team_name, "review",
+                                                "{} needs a verdict (reviewers: {})".format(
+                                                    item.id, ", ".join(item.review_by)),
+                                                _work.clip(item.summary, 120), manager or "human", None,
                                                 [CLI, "--team", team_name, "work", "review", item.id, "--approve"], item.updated_at))
             elif item.status in _work.SETTLED_NEEDS_DECISION and (manager is None or item.requester == "human"):
                 lanes["needs_you"].append(_card("needs_you", team_name, "decision", "{} ended {}: {}".format(item.id, item.status, _work.clip(item.title, 70)),

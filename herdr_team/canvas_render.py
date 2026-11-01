@@ -193,7 +193,13 @@ def font_dirs(env: Optional[Mapping[str, str]] = None) -> List[str]:
         pass
     home = source.get("HOME")
     if home:
-        dirs.append(os.path.join(home, "Library", "Fonts"))
+        # The list is macOS font folders, so it is POSIX: ``MAC_FONT_DIRS`` are
+        # POSIX literals ("/Library/Fonts"), and joining the home directory
+        # with the PLATFORM separator put a native separator in the middle of
+        # a list whose other entries are POSIX - one list, two shapes
+        # (measured 2026-10-22, W-36). The folder is a macOS path whatever
+        # the host is, so it is joined with "/".
+        dirs.append(home.rstrip("/") + "/Library/Fonts")
     return dirs
 
 

@@ -550,7 +550,15 @@ class RequestParamsTests(unittest.TestCase):
             self.assertIn(kind, SUBSCRIPTION_KINDS, kind)
         manifest = (Path(__file__).resolve().parent.parent / "herdr-plugin.toml").read_text(encoding="utf-8")
         hooked = re.findall(r'^on\s*=\s*"([^"]+)"', manifest, re.MULTILINE)
-        self.assertEqual(sorted(hooked), ["pane.agent_detected", "pane.closed", "pane.exited"])
+        # The port registers a windows hook beside every unix hook - the manifest
+        # alternates the unix hook with its twin, and tests/test_scaffold.py
+        # asserts the same twin structure for the actions and the startup
+        # entries - so each kind appears twice, once per platform family, and
+        # the three kinds are still the only ones the plugin subscribes to.
+        self.assertEqual(len(hooked), 6)
+        self.assertEqual(sorted(set(hooked)), ["pane.agent_detected", "pane.closed", "pane.exited"])
+        for kind in sorted(set(hooked)):
+            self.assertEqual(hooked.count(kind), 2, kind)
         for kind in hooked:
             self.assertIn(kind, SUBSCRIPTION_KINDS, kind)
             self.assertIn(hooks.normalize_event_name(kind), hooks.EVENTS, kind)

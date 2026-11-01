@@ -17,7 +17,14 @@ from unittest import mock
 from support import FAKE_AGENTS, PLUGIN_ROOT, TempState, whiteboard_on
 from test_cmd_roster import env_no_daemon, json_out, live_api, run_cli
 
-from herdr_team import cli, cmd_misc, cmd_whiteboard, features, operator, render, roster, store
+from herdr_team import cli, cmd_misc, cmd_whiteboard, features, operator, paths, render, roster, store
+
+# The entrypoint id is the PRODUCT's, not this file's: the Windows manifest
+# registers a `-windows` twin for every entrypoint, and asking herdr for the
+# unix id on Windows gets `platform_unsupported` - the defect W-15 fixed for
+# the daemon's asks popup. So the id is asked of the product, the way
+# tests/test_asks.py already does it (W-23). The test keeps its meaning on
+# both platforms instead of being skipped.
 
 WORKER = "alpha-worker"   # claude, w2:p2
 STARTED = {"url": "http://127.0.0.1:4567/?ticket=abc", "port": 4567, "pid": 99, "writable": True, "started": True}
@@ -257,7 +264,8 @@ class OpenStopTests(Rig):
         self.assertTrue(payload["popup"])
         self.start.assert_not_called()
         [params] = [p for m, p in self.api.calls if m == "plugin.pane.open"]
-        self.assertEqual((params["plugin_id"], params["entrypoint"]), ("herdr-synapse", "whiteboard"))
+        self.assertEqual((params["plugin_id"], params["entrypoint"]),
+                             ("herdr-synapse", paths.entrypoint_id("whiteboard")))
         payload = self.ok(self.human("whiteboard", "open", "--popup", HERDR_PLUGIN_ID="herdr-synapse", HERDR_PLUGIN_ENTRYPOINT_ID="whiteboard"))
         self.assertEqual(payload["browser"], "opened")
         self.assertTrue(self.start.call_args.args[2].trusted_human, "the popup tier is the operator, so the page can write")

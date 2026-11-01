@@ -15,7 +15,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from support import PLUGIN_ROOT
+from support import PLUGIN_ROOT, requires_posix
 
 
 def load(name):
@@ -532,6 +532,17 @@ class Live(unittest.TestCase):
         self.assertIn("| 1200 |", summary)
 
 
+#: The rig these three tests need is a UNIX rig: the stand-in ``herdr`` is a
+#: shebang script (Windows cannot execute an extensionless file, so the REAL
+#: herdr is found on PATH instead), and the runner types a shlex-quoted
+#: command into a pane. Porting the rig is its own item; until then these
+#: tests cannot run on Windows, and the honest form of that is a skip that
+#: says why. The skip checks for the SHELL and not for the platform, so a
+#: unix box still RUNS and PASSES them.
+RIG_REASON = ("the bench rig is a unix rig: the stand-in herdr is a shebang "
+              "script and the runner types a shlex-quoted command into a pane")
+
+
 class HerdrCommands(unittest.TestCase):
     """The real runner's command lines, against a stand-in ``herdr`` on its own PATH (never the real one)."""
 
@@ -555,12 +566,14 @@ class HerdrCommands(unittest.TestCase):
         return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
 
     def test_prompt_delivery_and_status(self):
+        requires_posix(RIG_REASON)
         runner = B.HerdrRunner("l6", "prompt", env=self.env)
         runner.deliver("l6-drawer", "w1:p2", "Draw it. " + B.DELIVERY_TAIL)
         self.assertEqual(runner.status("w1:p2"), "working")
         self.assertEqual(self.calls(), [["agent", "prompt", "w1:p2", "Draw it. " + B.DELIVERY_TAIL], ["agent", "get", "w1:p2"]])
 
     def test_post_delivery_types_the_operators_command(self):
+        requires_posix(RIG_REASON)
         runner = B.HerdrRunner("l6", "post", shell_pane="w1:p1", env=self.env)
         runner.deliver("l6-coder", "w1:p3", "Chart the operator's revenue.")
         (text, keys) = self.calls()
@@ -576,6 +589,7 @@ class HerdrCommands(unittest.TestCase):
 
     def test_the_pane_is_read_unwrapped_and_a_failure_is_no_text(self):
         """The pane read of C2: the tail of the pane, unwrapped, and a notice found in what it prints."""
+        requires_posix(RIG_REASON)
         runner = B.HerdrRunner("l6", env=self.env)
         text = runner.pane_text("w1:p2")
         self.assertEqual(self.calls(), [["pane", "read", "w1:p2", "--source", "recent-unwrapped", "--lines", str(B.PANE_LINES)]])

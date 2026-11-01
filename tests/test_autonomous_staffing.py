@@ -103,10 +103,17 @@ class Reservations(unittest.TestCase):
                 setattr(caller, field, value)
                 with self.assertRaises(HerdrTeamError):
                     S.require_manager(team, caller)
+            # Being the manager is not the same as holding the operator's
+            # authority: the flag is never set implicitly, and a plain manager
+            # does not get to approve the staffing policy.
             caller = manager()
-            caller.operator = True
             with self.assertRaises(HerdrTeamError):
                 S.operator(caller)
+            # A delegate of the team does hold it: the operator delegated it
+            # authority for this team, so the policy is its to approve.
+            delegate = manager()
+            delegate.operator = True
+            S.operator(delegate)
             self.assertFalse(manager().operator)
 
     def test_pause_and_existing_name_refuse_before_start(self):

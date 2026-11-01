@@ -63,8 +63,10 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from herdr_team import VERSION, features, store
+from herdr_team import platform_compat as _compat
 from herdr_team.errors import EXIT_REFUSED, HerdrTeamError
 from herdr_team.paths import TEAM_NAME_RE, SessionPaths, TeamPaths, check_not_symlink, ensure_dir, plugin_root
+from herdr_team.platform_compat import IS_WINDOWS, detached_creation_flags
 
 STATE_FILE = "whiteboard.json"
 LOG_FILE = "whiteboard.log"
@@ -173,9 +175,12 @@ NOT_SIGNED_IN_HTML = (
 
 def _spawn(argv: List[str], env: Dict[str, str], log_path: Path) -> int:
     """Start the detached ``whiteboard-serve`` process; its pid."""
-    log_fd = os.open(os.fspath(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC, 0o600)
+    log_fd = os.open(os.fspath(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=log_fd, stderr=log_fd, start_new_session=True, close_fds=True)
+        proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=log_fd, stderr=log_fd,
+                                start_new_session=not IS_WINDOWS,
+                                creationflags=detached_creation_flags() if IS_WINDOWS else 0,
+                                close_fds=True)
     finally:
         os.close(log_fd)
     return proc.pid
@@ -183,8 +188,11 @@ def _spawn(argv: List[str], env: Dict[str, str], log_path: Path) -> int:
 
 #: Test hook: ``SPAWN(argv, env, log_path) -> pid``.
 SPAWN: Callable[[List[str], Dict[str, str], Path], int] = _spawn
-#: Test hook: signals the recorded server process (``os.kill``).
-KILL: Callable[[int, int], None] = os.kill
+#: Test hook: signals the recorded server process.
+#:
+#: Windows has no catchable ``SIGTERM`` for a detached process, so the
+#: whiteboard server is stopped with ``taskkill`` there.
+KILL: Callable[[int, int], None] = (lambda pid, sig: _compat.terminate_pid(pid, force=True)) if IS_WINDOWS else os.kill
 #: Test hook: opens the page for ``start(open_browser=True)``.
 OPEN_BROWSER: Callable[[str], bool] = webbrowser.open
 
@@ -749,7 +757,10 @@ def serve(layout: Any, env: Mapping[str, str], port: int = 0, idle_timeout_s: fl
 
         for signum in (signal.SIGTERM, signal.SIGINT):
             previous[signum] = signal.signal(signum, on_signal)
-        previous[signal.SIGHUP] = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        # ``SIGHUP`` does not exist on Windows.
+        sighup = getattr(signal, "SIGHUP", None)
+        if sighup is not None:
+            previous[sighup] = signal.signal(sighup, signal.SIG_IGN)
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.25}, name="whiteboard-http", daemon=True)
     thread_started = False
     try:
@@ -1347,7 +1358,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _static_file(self, path: Path, rel: str, public: bool = False) -> None:
         immutable = rel.startswith(IMMUTABLE_PREFIXES)
         try:
-            fd = os.open(os.fspath(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            fd = os.open(os.fspath(path), os.O_RDONLY | _compat.nofollow_flags())
         except OSError:
             raise HerdrTeamError("not_found", "no such file", EXIT_REFUSED)
         with os.fdopen(fd, "rb") as handle:

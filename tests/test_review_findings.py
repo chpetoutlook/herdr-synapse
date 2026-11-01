@@ -9,6 +9,8 @@ changed by the review.
 from __future__ import annotations
 
 import os
+import sys
+import tempfile
 import time
 import unittest
 
@@ -256,7 +258,15 @@ class TailerRewriteTests(unittest.TestCase):
             inode = tailer.inode
             data = store.read_bytes(ts.team.board_jsonl)
             restored = data + data  # a restored backup larger than the stale offset, restarting at seq 1
-            fd = os.open(ts.team.board_jsonl, os.O_WRONLY | os.O_TRUNC)
+            # The fixture is written as BYTES, so the open must be a BYTE-level
+            # one: without O_BINARY a text-mode write translates every newline
+            # into two bytes, the file on disk ends up LONGER than the bytes
+            # handed to write, and the tailer - which resumes at the end of the
+            # file that is actually on disk - is right while this expectation
+            # is not (measured 2026-10-22, W-38).  O_BINARY does not exist on
+            # POSIX, so the flag is added only where it does.
+            fd = os.open(ts.team.board_jsonl, os.O_WRONLY | os.O_TRUNC
+                        | getattr(os, "O_BINARY", 0))
             try:
                 os.write(fd, restored)
             finally:
@@ -284,7 +294,7 @@ from unittest import mock
 
 from herdr_team import claude_settings, cmd_hooks, cmd_roster, cmd_ui, hooks as H, ledger as L, paths, roster
 from herdr_team.errors import EXIT_OK, EXIT_REFUSED
-from support import PLUGIN_ROOT, FakeApi, FakeError, fake_agent
+from support import PLUGIN_ROOT, FakeApi, FakeError, fake_agent, requires_posix_sh
 from test_cmd_board import pane_api as _pane_api
 from test_cmd_roster import env_no_daemon, live_api
 from test_daemon import FakeClock, trust_kinds
@@ -594,7 +604,7 @@ class ShowCatRootsTests(unittest.TestCase):
         with TempState() as ts:
             work = ts.tmp / "work"
             (work / ".aws").mkdir(parents=True)
-            (work / ".aws" / "credentials").write_text("secret\n")
+            (work / ".aws" / "credentials").write_bytes(b"secret\n")
             (work / "notes.md").write_text("plain\n")
             (ts.home / ".ssh").mkdir()
             (ts.home / ".ssh" / "id_ed25519").write_text("KEY\n")
@@ -624,6 +634,8 @@ class ShimQuotingTests(unittest.TestCase):
     """Low (safety): a single quote in the plugin path must not break or open the sh literal."""
 
     def test_render_shim_escapes_a_single_quote(self):
+        requires_posix_sh("the Claude hook shim is a POSIX shell script with the CLI path baked in; "
+                          "Windows cannot execute it, and a machine without sh on PATH cannot either")
         text = claude_settings.render_shim(Path("/Users/o'brien/herdr-synapse/bin/herdr-synapse"))
         self.assertIn("HERDR_TEAM_CLI='/Users/o'\\''brien/herdr-synapse/bin/herdr-synapse'", text)
         proc = subprocess.run(["sh", "-n"], input=text.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
@@ -636,6 +648,8 @@ class ShimLogPathTests(unittest.TestCase):
     """Low (safety): the shim never appends to a predictable name in a shared temp dir."""
 
     def test_no_fixed_log_in_tmp(self):
+        requires_posix_sh("the Claude hook shim is a POSIX shell script; this test RUNS it, and "
+                          "Windows cannot execute a /bin/sh script")
         source = (PLUGIN_ROOT / "hooks" / "claude" / "herdr-synapse-hook.sh").read_text()
         self.assertNotIn("/tmp/herdr-synapse-hook.log", source)
         tmp = Path(tempfile.mkdtemp(prefix="ht-log-"))
@@ -661,6 +675,8 @@ class BinHookExitTests(unittest.TestCase):
     """Low (safety): the manifest event hook exits 0 even when the launcher cannot run (plan 9/12: hooks exit 0)."""
 
     def test_slow_path_exits_zero_with_a_bogus_python(self):
+        requires_posix_sh("this test RUNS bin/hook, which is the POSIX sh script upstream ships; "
+                          "on Windows the file is not a Win32 application")
         with TempState() as ts:
             env = ts.env_with(HERDR_TEAM_PYTHON="/nonexistent/python3", PATH="/usr/bin:/bin")
             proc = subprocess.run([os.fspath(PLUGIN_ROOT / "bin" / "hook"), "agent_detected"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, env=env)
@@ -676,11 +692,19 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(cmd_roster.editor_command({"VISUAL": "subl -w", "EDITOR": "vi"}), ["subl", "-w"])
         self.assertEqual(cmd_roster.editor_command({}), ["vi"])
         with self.assertRaises(HerdrTeamError) as ctx:
-            cmd_roster.run_editor(["/nonexistent/editor", "--wait"], "/tmp/x.md")
+            cmd_roster.run_editor([os.path.join(tempfile.gettempdir(), "nonexistent-editor"), "--wait"],
+                                  os.path.join(tempfile.gettempdir(), "x.md"))
         self.assertEqual(ctx.exception.code, "editor_failed")
         self.assertEqual(ctx.exception.exit_code, EXIT_REFUSED)
+        # An editor that RAN and exited 3. It used to be ["sh", "-c", "exit 3"],
+        # and there is no sh on Windows: the product refused a missing editor
+        # (a different shape, with no returncode to read) and the test's
+        # KeyError was the result. The shape is the point, not sh - so the
+        # editor is the interpreter that is certainly there, exiting 3, and
+        # the file is this platform's temp dir.
         with self.assertRaises(HerdrTeamError) as ctx:
-            cmd_roster.run_editor(["sh", "-c", "exit 3"], "/tmp/x.md")
+            cmd_roster.run_editor([sys.executable, "-c", "import sys; sys.exit(3)"],
+                                  os.path.join(tempfile.gettempdir(), "x.md"))
         self.assertEqual(ctx.exception.details["returncode"], 3)
 
 
@@ -783,7 +807,7 @@ class ConsoleLifecycleTests(unittest.TestCase):
             self.assertEqual(result["reopened"], "w1:p9")
             self.assertEqual([p for m, p in api.calls if m == "pane.close"], [{"pane_id": "w1:p2"}])
             opened = [p for m, p in api.calls if m == "plugin.pane.open"]
-            self.assertEqual(opened[0]["entrypoint"], "console")
+            self.assertEqual(opened[0]["entrypoint"], paths.entrypoint_id("console"))
 
 
 class DaemonStartDutiesTests(unittest.TestCase):
@@ -1010,7 +1034,15 @@ class TailerMidLineRewriteTests(unittest.TestCase):
             fourth = json.loads(lines[2].decode("utf-8"))
             fourth["seq"] = 4
             restored = (json.dumps(first) + "\n" + json.dumps(fourth) + "\n").encode("utf-8")
-            fd = os.open(ts.team.board_jsonl, os.O_WRONLY | os.O_TRUNC)
+            # The fixture is written as BYTES, so the open must be a BYTE-level
+            # one: without O_BINARY a text-mode write translates every newline
+            # into two bytes, so the file on disk ends up LONGER than the bytes
+            # handed to write, and the tailer - which resumes at the end of the
+            # file that is actually on disk - is right while this expectation is
+            # not (measured 2026-10-22, W-38).  O_BINARY does not exist on
+            # POSIX, so the flag is added only where it does.
+            fd = os.open(ts.team.board_jsonl, os.O_WRONLY | os.O_TRUNC
+                        | getattr(os, "O_BINARY", 0))
             try:
                 os.write(fd, restored)
             finally:
@@ -1022,6 +1054,7 @@ class TailerMidLineRewriteTests(unittest.TestCase):
             self.assertTrue(any("rewritten" in w for w in tailer.warnings), tailer.warnings)
             self.assertTrue(any(r.get("synthetic") for r in out), "a reset_detected record is emitted")
             self.assertIn(4, [r.get("seq") for r in out], "the newer tail is still delivered after the reset")
+
             self.assertEqual(tailer.offset, len(restored), "resumed at the end of the rewritten file")
 
 

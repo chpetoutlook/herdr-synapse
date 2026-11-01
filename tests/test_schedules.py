@@ -14,7 +14,7 @@ from unittest import mock
 from herdr_team import daemon as D
 from herdr_team import console, operator, render, schedules as S, store, tui_model
 from herdr_team.errors import HerdrTeamError
-from support import FakeApi, TempState, wait_until
+from support import FakeApi, TempState, requires_posix_sh, wait_until
 from test_cmd_roster import env_no_daemon, json_out, live_api, run_cli
 from test_daemon import make_daemon
 
@@ -42,6 +42,40 @@ def local(moments):
 
 # --------------------------------------------------------------------------
 # the cron engine
+
+
+
+def _precheck_sleep_then_echo() -> str:
+    """A precheck that outlives its timeout, in THIS platform's shell.
+
+    The product runs a precheck under the platform's shell - ``/bin/sh -c``
+    on unix, ``%COMSPEC% /c`` on Windows (schedules.py).  So the STRING a
+    test schedules has to be that platform's shell syntax, or the test is
+    asserting POSIX shell behaviour on a platform whose shell is cmd.exe.
+    On unix the string is unchanged (2026-10-22 port fix, W-41).
+    """
+    if os.name == "nt":
+        # "timeout /t" is not a sleep here: it refuses a redirected stdin,
+        # which is what the product gives it, and it answers "Invalid
+        # syntax" on this shell (measured 2026-10-22).  The ping form is the
+        # classic cmd.exe sleep and it does not read stdin, so it works
+        # under the product's own conditions.
+        return "ping -n 6 127.0.0.1 >nul & echo late"
+    return "sleep 5; echo late"
+
+
+def _precheck_dir_present(name: str) -> str:
+    """A precheck that succeeds when ``name`` is a directory, in THIS platform's shell."""
+    if os.name == "nt":
+        return "if exist {}\\ (exit 0) else (exit 1)".format(name)
+    return "test -d {}".format(name)
+
+
+def _precheck_file_present(name: str) -> str:
+    """A precheck that succeeds when ``name`` exists, in THIS platform's shell."""
+    if os.name == "nt":
+        return "if exist {} (exit 0) else (exit 1)".format(name)
+    return "test -s {}".format(name)
 
 
 class CronParseTests(unittest.TestCase):
@@ -366,11 +400,23 @@ class CliTests(unittest.TestCase):
         code, out, err = cli(self.ts, ["schedule", "run", "s1"])
         self.assertEqual((code, out["outcome"], out["precheck"]["exit_code"]), (0, "skipped", 3), err)
         self.assertEqual(len(board(self.ts)), before)
-        self.add("--every", "daily", "--to", "all", "--precheck", "sleep 5; echo late", "--precheck-timeout", "1")
+        self.add("--every", "daily", "--to", "all", "--precheck", _precheck_sleep_then_echo(), "--precheck-timeout", "1")
         started = time.monotonic()
         code, _out, err = cli(self.ts, ["schedule", "run", "s2"])
         self.assertEqual((code, err["code"]), (1, "schedule_precheck_failed"))
-        self.assertLess(time.monotonic() - started, 4.0)
+        # The precheck is killed at its own 1 s timeout, and the run must end
+        # soon after.  How soon depends on the platform's KILL MECHANISM:
+        # on unix a kill is a signal and is instant, but on Windows the tree
+        # is killed with `taskkill /T /F` - a separate process that has to
+        # start, walk the tree and tear it down (measured 1.4 s, 2.5 s,
+        # 3.5 s and 6.0 s on this machine, 2026-10-22).  A 4 s budget
+        # therefore cannot hold on Windows, and a bound that cannot hold on
+        # the platform is a flaky test wearing a determinism's clothes, so
+        # the budget is the precheck's own timeout plus an allowance for the
+        # platform's kill (the port's idiom for a timing bound: a generous
+        # number with a stated reason).
+        budget = 4.0 if os.name != "nt" else 30.0
+        self.assertLess(time.monotonic() - started, budget)
 
     def test_who_shows_the_next_fire(self):
         self.add("--every", "weekdays", "--to", "all", "--name", "brand")
@@ -407,11 +453,11 @@ class AuthorityTests(unittest.TestCase):
         code, out, err = self.as_member(["schedule", "add", "Draft the weekly digest", "--every", "weekly", "--day", "fri", "--to", "all"])
         self.assertEqual(code, 0, err)
         self.assertEqual(out["schedule"]["created_by"], "alpha-worker")
-        code, _out, err = self.as_member(["schedule", "add", "Digest if there is news", "--every", "daily", "--to", "all", "--precheck", "test -s news.txt"])
+        code, _out, err = self.as_member(["schedule", "add", "Digest if there is news", "--every", "daily", "--to", "all", "--precheck", _precheck_file_present("news.txt")])
         self.assertEqual((code, err["code"]), (1, "author_mismatch"))
         self.assertIn("operator in person", err["message"])
         # the operator may; the delegate may then pause or remove it, not run or re-arm it
-        self.assertEqual(cli(self.ts, ["schedule", "add", "Digest if there is news", "--every", "daily", "--to", "all", "--precheck", "test -s news.txt"])[0], 0)
+        self.assertEqual(cli(self.ts, ["schedule", "add", "Digest if there is news", "--every", "daily", "--to", "all", "--precheck", _precheck_file_present("news.txt")])[0], 0)
         self.assertEqual(self.as_member(["schedule", "run", "s2"])[2]["code"], "author_mismatch")
         self.assertEqual(self.as_member(["schedule", "disable", "s2"])[0], 0)
         self.assertEqual(self.as_member(["schedule", "enable", "s2"])[2]["code"], "author_mismatch")
@@ -640,7 +686,11 @@ class DaemonFiringTests(unittest.TestCase):
         self.assertIn("timed out after 1m", failed["text"])
 
     def test_a_real_precheck_runs_in_a_worker_thread(self):
-        add_entry(self.ts, "s1", "0 9 * * *", precheck="test -d .")
+        # The precheck string is the PLATFORM's shell: the product runs it under
+        # cmd.exe /c on Windows and /bin/sh -c on unix, so "test -d ." (POSIX
+        # test(1)) is not a command cmd.exe has.  The Windows form asks the
+        # same question in that shell (2026-10-22 port fix, W-41).
+        add_entry(self.ts, "s1", "0 9 * * *", precheck=_precheck_dir_present("."))
         runner = S.Runner(self.ts.layout, "alpha", self.ts.env)
         start = epoch(2026, 9, 23, 9, 0, 1)
         runner.tick(start, 100.0)
@@ -711,6 +761,8 @@ class ConsoleTests(unittest.TestCase):
 
 class PrecheckProcessTests(unittest.TestCase):
     def test_exit_codes_output_and_a_killed_process_group(self):
+        requires_posix_sh("the precheck commands are POSIX shell built-ins, and the timeout path "
+                          "depends on killing a POSIX process group; Windows has neither")
         with TempState() as ts:
             env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(ts.home), "LANG": "C"}
             ok = S.run_precheck("echo fresh mentions", os.fspath(ts.tmp), env, 5)

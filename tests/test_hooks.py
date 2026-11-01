@@ -13,7 +13,7 @@ import unittest
 
 from herdr_team import cmd_board, hooks, paths, store
 from herdr_team.cli import main as cli_main
-from support import FAKE_MEMBERS, FakeApi, FakeError, TempState, fake_agent, identity_tokens
+from support import FAKE_MEMBERS, FakeApi, FakeError, TempState, fake_agent, identity_tokens, wait_until
 
 
 def event_env(ts, event="pane.agent_detected", pane_id="w2:p1", **extra):
@@ -356,10 +356,20 @@ class LogTests(unittest.TestCase):
     def test_alarm_is_armed_and_cleared(self):
         ts = TempState()
         self.addCleanup(ts.cleanup)
-        previous = signal.getsignal(signal.SIGALRM)
-        self.addCleanup(signal.signal, signal.SIGALRM, previous)
         api = FakeApi(ts.socket_path)
         out = io.StringIO()
+        if os.name == "nt":
+            # Windows has no SIGALRM and no signal.alarm(): the hook arms a
+            # TIMER THREAD instead and cancels it on the way out. The
+            # equivalent assertion is that no timer is left running - the same
+            # intent, the platform's own mechanism (2026-10-21 port fix, W-9).
+            hooks.run_hook_event(["agent_detected"], event_env(ts), api=api, stdout=out)
+            self.assertTrue(
+                wait_until(lambda: not any(timer.is_alive() for timer in hooks._ALARM_TIMERS), 3.0),
+                "the alarm timer was left armed after the hook")
+            return
+        previous = signal.getsignal(signal.SIGALRM)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
         hooks.run_hook_event(["agent_detected"], event_env(ts), api=api, stdout=out)
         self.assertEqual(signal.alarm(0), 0, "alarm left armed after the hook")
 

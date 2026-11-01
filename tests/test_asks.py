@@ -5,6 +5,7 @@ the operator, `post` never blocked, there was no popup and no policy.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import threading
@@ -12,7 +13,7 @@ import time
 import unittest
 from unittest import mock
 
-from herdr_team import asks, cmd_asks, cmd_misc, store, tui_model
+from herdr_team import asks, cmd_asks, cmd_misc, operator, store, tui_model
 from herdr_team import daemon as D
 from herdr_team.errors import EXIT_NO_ANSWER, HerdrTeamError
 from support import FakeApi, TempState
@@ -29,6 +30,42 @@ def err_of(err):
     return {}
 from test_cmd_roster import live_api
 from test_daemon import make_daemon
+
+
+def _console_reply_in_process(args, env, timeout: float = 0.0):
+    """W-14 rig: run the console-spawned CLI child in-process (same contract).
+
+    The ack path answers the operator through a real child process
+    (``console.run_cli`` spawns ``herdr-synapse``), and that child resolves
+    its author through the W-1 ancestry sweep. On Windows the suite runner
+    is itself launched from an agent pane, so a real child IS a genuine
+    harness descendant and the sweep refuses it - a true fact about the
+    runner's ancestry, not a defect (the sweep stays ancestry-wide; case G
+    stays exit 3). The sweep rigs swap the process table only in-process;
+    a spawned child cannot be rigged that way. So this rig runs the same
+    argv in-process - the one place the suite's disclosed test-environment
+    skip already holds - with the same env, the same
+    ``(rc, stdout json, stderr json)`` contract, and ``api=None`` exactly
+    like the real child. The product's child spawn is unchanged, and skip:
+    on harness-descended Windows runners the console-reply child is
+    exercised in-process; a clean-runner full-tree run exercises the real
+    spawn.
+    """
+    from herdr_team import cli as _cli
+
+    out, err = io.StringIO(), io.StringIO()
+    code = _cli.main([str(a) for a in args], env=dict(env), stdout=out, stderr=err, api=None)
+    parsed = json.loads(out.getvalue()) if out.getvalue().strip() else None
+    first = err.getvalue().strip().split("\n", 1)[0]
+    err_obj = None
+    if first:
+        try:
+            obj = json.loads(first)
+        except ValueError:
+            err_obj = {"code": "cli_failed", "message": first} if code else None
+        else:
+            err_obj = obj if isinstance(obj, dict) and "code" in obj else None
+    return code, parsed, err_obj
 
 MEMBER = "alpha-reviewer"
 PEER = "alpha-worker"
@@ -185,16 +222,21 @@ class WaitTests(unittest.TestCase):
             for _ in range(200):
                 rows = [r for r in store.BoardStore(self.ts.team).read() if r.get("kind") == "question"]
                 if rows:
-                    run_cli(["--json", "--team", "alpha", "asks", "--ack", str(rows[-1]["seq"])], self.ts.env, FakeApi())
+                    _code, _out, err = run_cli(["--json", "--team", "alpha", "asks", "--ack", str(rows[-1]["seq"])], self.ts.env, FakeApi())
+                    ack_result["err"] = err
                     return
                 time.sleep(0.05)
 
-        thread = threading.Thread(target=ack)
-        thread.start()
-        code, out, err = json_out(run_cli(
-            ["--json", "post", "--to", "human", "--kind", "question", "--timeout", "20s", "submit?"],
-            self.env, live_api()))
-        thread.join()
+        ack_result: dict = {}
+        with mock.patch("herdr_team.console.run_cli", _console_reply_in_process):
+            thread = threading.Thread(target=ack)
+            thread.start()
+            code, out, err = json_out(run_cli(
+                ["--json", "post", "--to", "human", "--kind", "question", "--timeout", "20s", "submit?"],
+                self.env, live_api()))
+            thread.join()
+        if ack_result.get("err"):
+            self.fail("the ack thread was refused: {}".format(ack_result["err"]))
         self.assertEqual(code, 0, err)
         self.assertTrue(out["waited"])
         self.assertIn("not a decision", out["answer"]["text"], "the agent is told this was not approval")
@@ -346,6 +388,51 @@ class PopupModelTests(unittest.TestCase):
         self.assertIn("--reply-to", argv)
         self.assertEqual(argv[argv.index("--kind") + 1], "answer")
 
+    def test_the_console_says_that_it_answered(self):
+        # An acknowledgement CLOSES the console - the ask list empties and the
+        # loop ends - so without a line saying so, a successful Ctrl-A looks
+        # exactly like a quit and the operator cannot tell that the answer is
+        # on the board (W-23).
+        model = self.model(self.record(kind="blocked"))
+        intent = cmd_asks.ask_key(model, "CTRL_A")
+        notice = cmd_asks.answer_notice(intent)
+        self.assertIn("answered", notice)
+        self.assertIn("#7", notice)
+        self.assertIn("board", notice)
+        # the line is DRAWN: the status is part of what the console renders
+        model.status = notice
+        self.assertIn("answered", "\n".join(cmd_asks.ask_lines(model)))
+        # a reply says the same thing, in its own words
+        model2 = self.model(self.record(kind="blocked"))
+        for ch in "proceed":
+            cmd_asks.ask_key(model2, ch)
+        reply = cmd_asks.answer_notice(cmd_asks.ask_key(model2, "ENTER"))
+        self.assertIn("answered", reply)
+        self.assertIn("#7", reply)
+        # and it never reads as a quit
+        self.assertNotIn("quit", notice.lower())
+        self.assertNotIn("closed", notice.lower())
+
+    def test_the_hint_says_the_acknowledgement_is_announced(self):
+        # the hint must not offer a key whose effect the operator cannot tell
+        # from a quit, so it says that the acknowledgement is announced
+        lines = "\n".join(cmd_asks.ask_lines(self.model(self.record())))
+        self.assertIn("says so", lines)
+        self.assertIn("acknowledges", lines)
+
+    def test_the_console_runs_the_launcher_this_platform_can(self):
+        # the console shells out to the CLI to land an answer, and on Windows
+        # the POSIX sh script cannot be run at all - so a well-timed Ctrl-A
+        # could never land, whatever the console said afterwards (W-23).
+        from herdr_team import console
+
+        path = console.cli_path()
+        self.assertTrue(path.is_file(), "the launcher must exist: {}".format(path))
+        if os.name == "nt":
+            self.assertEqual(path.suffix, ".cmd", "Windows must run the .cmd launcher")
+        else:
+            self.assertEqual(path.name, "herdr-synapse", "unix must keep the sh script")
+
     def test_an_acknowledgement_never_reads_as_approval(self):
         # An agent that asked "should I submit?" must not take "seen" for a
         # yes. A peer's reply being read as approval is why this exists.
@@ -381,7 +468,8 @@ class AsksCommandTests(unittest.TestCase):
 
     def test_ack_closes_the_ask_and_leaves_the_operators_reply(self):
         seq = post(self.ts, kind="blocked", text="PRE-SUBMISSION STOP")
-        code, out, err = json_out(run_cli(["--json", "--team", "alpha", "asks", "--ack", str(seq)], self.ts.env, FakeApi()))
+        with mock.patch("herdr_team.console.run_cli", _console_reply_in_process):
+            code, out, err = json_out(run_cli(["--json", "--team", "alpha", "asks", "--ack", str(seq)], self.ts.env, FakeApi()))
         self.assertEqual((code, out["acknowledged"]), (0, seq), err)
         self.assertEqual(asks.pending(self.ts.team), [], "acknowledging closes it, unlike dismissing")
         reply = [r for r in store.BoardStore(self.ts.team).read() if r.get("reply_to") == seq][0]
@@ -416,7 +504,13 @@ class DaemonPopupTests(unittest.TestCase):
         self.team = self.d.teams["alpha"]
 
     def opens(self):
-        return [p for m, p in self.api.calls if m == "plugin.pane.open" and p.get("entrypoint") == "asks"]
+        # the entrypoint id the PORT asks for, not a hardcoded unix id: the
+        # Windows manifest registers asks-windows, and the daemon asks for
+        # the id of the platform it runs on (W-9 shape, W-23).
+        from herdr_team import paths
+
+        wanted = paths.entrypoint_id("asks")
+        return [p for m, p in self.api.calls if m == "plugin.pane.open" and p.get("entrypoint") == wanted]
 
     def ingest(self):
         """What one tick does before ``raise_asks``: the daemon learns of an ask
@@ -488,3 +582,134 @@ class DaemonPopupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DelegateAuthorityTests(unittest.TestCase):
+    """The lead and the manager hold the operator's authority for their team.
+
+    Nothing waits on a person who is not in the team's loop: a delegate does
+    not wait for the operator's answer, and a delegate's answer closes the ask
+    the same way the operator's does. A peer answer still closes nothing --
+    that is the rule the whole module exists to protect.
+    """
+
+    def setUp(self):
+        self.ts = TempState()
+        self.addCleanup(self.ts.cleanup)
+        self.env = self.ts.env_with(HERDR_PANE_ID="w2:p1")
+
+    def pending(self):
+        return [r["seq"] for r in asks.pending(self.ts.team, dismissed=asks.dismissed(self.ts.team))]
+
+    def test_a_delegate_does_not_wait_for_the_operator(self):
+        operator.grant(self.ts.session, "alpha", MEMBER, ttl_s=0)
+        started = time.monotonic()
+        code, out, err = json_out(run_cli(
+            ["--json", "post", "--to", "human", "--kind", "question", "--timeout", "20s", "need a call"],
+            self.env, live_api()))
+        self.assertEqual(code, 0, err)
+        self.assertFalse(out["waited"], "a delegate waits for nobody")
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_a_delegate_may_not_ask_to_wait(self):
+        operator.grant(self.ts.session, "alpha", MEMBER, ttl_s=0)
+        code, _out, err = json_out(run_cli(
+            ["--json", "post", "--to", "human", "--kind", "question", "--wait", "need a call"],
+            self.env, live_api()))
+        self.assertEqual((code, err_of(err)["code"]), (2, "usage"))
+
+    def test_a_delegates_answer_closes_the_ask(self):
+        operator.grant(self.ts.session, "alpha", MEMBER, ttl_s=0)
+        seq = post(self.ts)
+        self.assertEqual(self.pending(), [seq])
+        post(self.ts, "ruled: proceed", kind="answer", author=MEMBER, to=("human",), reply_to=seq)
+        self.assertNotIn(seq, self.pending(), "the delegate holds the operator's authority")
+
+    def test_a_peer_answer_still_closes_nothing(self):
+        operator.grant(self.ts.session, "alpha", MEMBER, ttl_s=0)
+        seq = post(self.ts)
+        post(self.ts, "I think you should proceed", kind="answer", author=PEER, to=("human",), reply_to=seq)
+        self.assertIn(seq, self.pending(), "a peer answer is a note, not an answer")
+
+    def test_a_revoked_grant_closes_nothing(self):
+        operator.grant(self.ts.session, "alpha", MEMBER, ttl_s=0)
+        operator.revoke(self.ts.session, "alpha", MEMBER)
+        seq = post(self.ts)
+        post(self.ts, "ruled: proceed", kind="answer", author=MEMBER, to=("human",), reply_to=seq)
+        self.assertIn(seq, self.pending(), "no grant, no authority")
+
+class OnlyTheAskingKindsAreAsksTests(unittest.TestCase):
+    """The ask queue holds the posts that want an answer, and only those.
+
+    The queue is the one list that means "somebody has to answer this", so
+    every entry in it costs a person a decision. A completion notice, a note
+    or a handoff addressed to the operator is a report: the operator reads it,
+    but nothing is waiting on them. Narrowing the kinds keeps the queue
+    honest -- and keeps the manager's sweep, which names the open asks,
+    pointing at real work.
+    """
+
+    def setUp(self):
+        self.ts = TempState()
+        self.addCleanup(self.ts.cleanup)
+
+    def pending(self):
+        return [r["seq"] for r in asks.pending(self.ts.team, dismissed=asks.dismissed(self.ts.team))]
+
+    def test_the_kinds_that_want_an_answer_are_asks(self):
+        for kind in ("question", "request", "blocked"):
+            seq = post(self.ts, kind=kind)
+            self.assertIn(seq, self.pending(), kind)
+
+    def test_the_kinds_that_report_are_not_asks(self):
+        for kind in ("note", "done", "handoff", "answer"):
+            post(self.ts, kind=kind)
+            self.assertEqual(self.pending(), [], kind)
+
+    def test_a_completion_notice_to_the_operator_is_not_an_ask(self):
+        """The shape that made the queue lie: "W-26 complete" is not a question."""
+        post(self.ts, "W-26 complete: L503 QUEUED", kind="done")
+        self.assertEqual(self.pending(), [])
+
+    def test_a_report_to_the_operator_does_not_block_the_posting_seat(self):
+        """A report returns at once: it never becomes a wait."""
+        seq = post(self.ts, "W-26 complete", kind="done")
+        self.assertEqual(self.pending(), [])
+        self.assertFalse(asks.is_ask(store.BoardStore(self.ts.team).read(seq - 1)))
+
+    def test_the_narrowing_does_not_hide_a_real_ask(self):
+        """The kinds that were always asks are still asks."""
+        seq = post(self.ts, "need a decision", kind="request")
+        self.assertEqual(self.pending(), [seq])
+
+
+class DelegateIsNotAnAskTests(unittest.TestCase):
+    """A delegate's own post is not a request the operator has to answer.
+
+    The ask queue means "a person is needed here". A seat that holds the
+    operator's authority for the team is the operator's hands, so its courtesy
+    notes do not fill the one list that should hold the asks that really need
+    a person.
+    """
+
+    def setUp(self):
+        self.ts = TempState()
+        self.addCleanup(self.ts.cleanup)
+
+    def _delegate_post(self, text="ruled: proceed", kind="note"):
+        rec = {"from": MEMBER, "from_kind": "codex", "from_terminal": "term_r1",
+               "origin": {"via": "cli", "verified": True,
+                          "operator": {"granted_at": "2026-10-31T00:00:00Z", "expires_at": None}},
+               "to": ["human"], "kind": kind, "text": text}
+        return store.BoardStore(self.ts.team).append(rec)
+
+    def test_a_delegates_post_is_not_an_ask(self):
+        self._delegate_post()
+        self.assertEqual(asks.pending(self.ts.team), [])
+
+    def test_an_ordinary_members_post_is_still_an_ask(self):
+        rec = {"from": PEER, "from_kind": "claude", "from_terminal": "term_w1",
+               "origin": {"via": "cli", "verified": True},
+               "to": ["human"], "kind": "question", "text": "need a call"}
+        store.BoardStore(self.ts.team).append(rec)
+        self.assertEqual(len(asks.pending(self.ts.team)), 1)

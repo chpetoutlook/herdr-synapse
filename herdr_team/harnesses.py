@@ -145,7 +145,8 @@ def _run(argv: Sequence[str], cwd: Optional[str], env: Optional[Dict[str, str]])
     """``argv`` in ``cwd`` with no terminal and a deadline; (-1, "") when it cannot run."""
     try:
         result = subprocess.run(list(argv), cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True, timeout=PROBE_TIMEOUT_S)
+                                stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                                timeout=PROBE_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError, ValueError):
         return -1, ""
     return result.returncode, result.stdout or ""

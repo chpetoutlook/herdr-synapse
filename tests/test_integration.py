@@ -24,6 +24,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import unittest
@@ -92,7 +93,10 @@ def run_cli(argv, env, api):
 
 
 def write_live_daemon(ts):
-    start = subprocess.run(["ps", "-o", "lstart=", "-p", str(os.getpid())], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, check=False).stdout.decode().strip()
+    # The identity token the product writes: `ps -o lstart=` on unix, the process creation time on Windows (`ps` does not exist there).
+    from herdr_team.cmd_board import process_start_time
+
+    start = process_start_time(os.getpid()) or ''
     store.write_json(ts.session.daemon_json, {"pid": os.getpid(), "start_time": start, "beat_at": now_iso(), "socket": os.fspath(ts.socket_path), "socket_inode": 1, "version": "0.1.0", "herdr_version": "0.8.2", "protocol": 20})
 
 
@@ -160,7 +164,9 @@ class Workflow1Tests(unittest.TestCase):
         self.assertEqual(rec1["to_role"], "worker")
 
         # 4. the human posts from a verified shell pane --------------------------------------
-        leader = os.getpgrp()
+        # The product's own abstraction: Windows has no POSIX process groups, so
+        # `os.getpgrp` does not exist there (2026-10-21 port fix).
+        leader = identity.own_pgrp()
         fake_shell = 777
         shell_pid = os.getppid() if leader == os.getpid() else fake_shell
         api.set_response("pane.process_info", {"type": "pane_process_info", "process_info": {
@@ -176,7 +182,7 @@ class Workflow1Tests(unittest.TestCase):
         self.assertTrue(identity.human_origin_ok(rec2["origin"]))
         # --as human from an agent pane is refused and audited. The worker pane's process tree
         # must contain this process (a CLI run inside the pane); the step-4 shell-pane override
-        # leaned on os.getpgrp() being a live ancestor, which fails once the launching shell has
+        # leaned on identity.own_pgrp() being a live ancestor, which fails once the launching shell has
         # exited (orphaned process group under a backgrounded runner: pane_mismatch instead).
         api.set_response("pane.process_info", {"type": "pane_process_info", "process_info": {
             "pane_id": WORKER_PANE, "shell_pid": os.getppid(), "foreground_process_group_id": os.getpid(),
@@ -275,17 +281,33 @@ class Workflow1Tests(unittest.TestCase):
         shim = ts.tmp / claude_settings.HOOK_FILE_NAME
         shim.write_text(claude_settings.render_shim(PLUGIN_ROOT / "bin" / "herdr-synapse"), encoding="utf-8")
         log = ts.tmp / "hook.log"
+        # The Claude hook shim is a POSIX sh script, so it needs a POSIX sh to
+        # run it. On Windows that is git-bash's sh (2026-10-21 port fix); the
+        # unix path is unchanged.
+        sh_exe = shutil.which("sh")
+        if sh_exe is None:
+            for candidate in (r"C:\Program Files\Git\bin\sh.exe", r"C:\Program Files\Git\usr\bin\sh.exe"):
+                if os.path.isfile(candidate):
+                    sh_exe = candidate
+                    break
+        if sh_exe is None:
+            self.skipTest("no POSIX sh available to run the Claude hook shim")
+        # The unix PATH is deliberately minimal so the shim's
+        # `command -v herdr-synapse` fallback cannot find anything; on Windows
+        # the real PATH is kept (git-bash needs it) - the fallback still finds
+        # nothing, because herdr-synapse is not installed on PATH here.
+        hook_path = "/usr/bin:/bin" if os.name != "nt" else os.environ.get("PATH", "")
         hook_env = self.env(
             HERDR_PANE_ID=WORKER_PANE,
             HERDR_TEAM_HOOK_LOG=os.fspath(log),
             HERDR_TEAM_PYTHON=sys.executable,
-            PATH="/usr/bin:/bin",
+            PATH=hook_path,
         )
         server = FakeHerdrServer(ts.socket_path)
         server.set_response("pane.get", lambda params, _req: api.responses["pane.get"](params))
         with server:
             proc = subprocess.run(
-                ["sh", os.fspath(shim), "prompt-submit"],
+                [sh_exe, os.fspath(shim), "prompt-submit"],
                 input=json.dumps({"session_id": "s1", "prompt": "hi"}).encode("utf-8"),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, env=hook_env, cwd=os.fspath(ts.tmp),
             )
@@ -301,7 +323,7 @@ class Workflow1Tests(unittest.TestCase):
         self.assertEqual(store.Cursors(team_paths).get("beta-worker")["seq"], max(seqs))
         # the stop hook blocks on the unread post, exit 2, message on stderr only
         with server:
-            proc = subprocess.run(["sh", os.fspath(shim), "stop"], input=b"{}", stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, env=hook_env, cwd=os.fspath(ts.tmp))
+            proc = subprocess.run([sh_exe, os.fspath(shim), "stop"], input=b"{}", stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, env=hook_env, cwd=os.fspath(ts.tmp))
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertEqual(proc.stdout, b"")
         self.assertIn(b"[herdr-team stop] 1 unread board post for beta-worker", proc.stderr)
@@ -327,7 +349,18 @@ class PackagingInvariantTests(unittest.TestCase):
         for key in ("startup", "actions", "events", "panes"):
             self.assertIsInstance(manifest[key], list, key)
         ons = [e["on"] for e in manifest["events"]]
-        self.assertEqual(len(ons), len(set(ons)), "duplicate [[events]] on")
+        # The Windows port gives every entry a per-platform twin (herdr forbids
+        # duplicate action/pane ids, so the windows ones carry a -windows
+        # suffix). The invariant that matters is that one event never fires
+        # twice on one platform - not that a platform has only one entry.
+        by_event = {}
+        for entry in manifest["events"]:
+            by_event.setdefault(entry["on"], []).append(tuple(entry.get("platforms") or ("macos", "linux")))
+        for on, platform_sets in by_event.items():
+            for index, first in enumerate(platform_sets):
+                for second in platform_sets[index + 1:]:
+                    overlap = set(first) & set(second)
+                    self.assertFalse(overlap, "event {} would fire twice on {}".format(on, sorted(overlap)))
         ids = [a["id"] for a in manifest["actions"]] + [p["id"] for p in manifest["panes"]]
         for entry in ids:
             self.assertRegex(entry, r"^[a-z][a-z0-9-]*$", entry)
@@ -335,6 +368,17 @@ class PackagingInvariantTests(unittest.TestCase):
         for entry in manifest["startup"] + manifest["actions"] + manifest["events"] + manifest["panes"]:
             command = entry["command"]
             self.assertIsInstance(command, list)
+            platforms = tuple(entry.get("platforms") or ("macos", "linux"))
+            if "windows" in platforms:
+                # The Windows twin runs through powershell and resolves the plugin
+                # root itself, because a command's cwd is not reliable there.
+                self.assertEqual(command[0], "powershell", command)
+                joined = " ".join(str(part) for part in command)
+                self.assertTrue(
+                    any(name in joined for name in ("herdr-synapse.cmd", "hook.ps1", "console.cmd")),
+                    command,
+                )
+                continue
             self.assertTrue(command[0].startswith("./") or command[0] == "sh", command)
             target = PLUGIN_ROOT / (command[1] if command[0] == "sh" else command[0])
             self.assertTrue(target.is_file(), target)
@@ -346,18 +390,40 @@ class PackagingInvariantTests(unittest.TestCase):
     def test_manifest_events_equal_daemon_subscriptions_minus_daemon_only_kinds(self):
         manifest = self.manifest()
         daemon_only = {"pane.moved", "pane.focused", "pane.updated"}
-        self.assertEqual(sorted(e["on"] for e in manifest["events"]), sorted(set(daemon.SUBSCRIPTIONS) - daemon_only))
+        # The set of events the manifest declares must equal what the daemon
+        # subscribes to. The Windows port adds a per-platform twin of each
+        # entry, so the comparison is over the distinct event names.
+        self.assertEqual(sorted({e["on"] for e in manifest["events"]}), sorted(set(daemon.SUBSCRIPTIONS) - daemon_only))
         self.assertTrue(daemon_only.issubset(set(daemon.SUBSCRIPTIONS)))
         for entry in manifest["events"]:
+            platforms = tuple(entry.get("platforms") or ("macos", "linux"))
+            if "windows" in platforms:
+                # The Windows twin calls the ported hook through powershell; the
+                # event name still has to be the one the hook expects.
+                joined = " ".join(str(part) for part in entry["command"])
+                self.assertIn("hook.ps1", joined)
+                self.assertIn(hooks.normalize_event_name(entry["on"]), joined)
+                continue
             self.assertEqual(entry["command"][0], "./bin/hook")
             self.assertEqual(hooks.normalize_event_name(entry["on"]), entry["command"][1], entry)
             self.assertIn(entry["command"][1], hooks.EVENTS)
 
     def test_shell_files_never_set_e_and_pass_sh_n(self):
+        # The unix shell files must still parse. On Windows there is no `sh` on PATH by
+        # default, but git-bash ships one - use it rather than dropping the check
+        # (2026-10-21 port fix).
+        sh = shutil.which("sh")
+        if sh is None:
+            for candidate in (r"C:\Program Files\Git\bin\sh.exe", r"C:\Program Files\Git\usr\bin\sh.exe"):
+                if os.path.isfile(candidate):
+                    sh = candidate
+                    break
+        if sh is None:
+            self.skipTest("no POSIX sh available to syntax-check the unix shell files")
         for path in self.SHELL_FILES:
             text = path.read_text(encoding="utf-8")
             self.assertNotRegex(text, r"^\s*set\s+-[a-z]*e", "{} must never set -e".format(path))
-            proc = subprocess.run(["sh", "-n", os.fspath(path)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+            proc = subprocess.run([sh, "-n", os.fspath(path)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
             self.assertEqual(proc.returncode, 0, (path, proc.stderr))
 
     def test_fcntl_only_in_store(self):

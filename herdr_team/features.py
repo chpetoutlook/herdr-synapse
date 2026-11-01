@@ -38,8 +38,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from herdr_team import store
+from herdr_team import platform_compat as _compat
 from herdr_team.errors import EXIT_REFUSED, HerdrTeamError
-from herdr_team.paths import SessionPaths, TeamPaths, ensure_dir, plugin_root
+from herdr_team.paths import SessionPaths, TeamPaths, cli_launcher_path, ensure_dir, plugin_root
 
 FEATURES_SCHEMA = 1
 FEATURES_FILE = "features.json"
@@ -368,10 +369,16 @@ def announce_layer(layout: Any, previous: bool, enabled: bool, by: str) -> Dict[
 
 
 def mcp_command(layout: Any, team: TeamPaths) -> Dict[str, Any]:
-    """The stdio MCP server for one team: this checkout's launcher, pinned to the session socket and the team dir."""
+    """The stdio MCP server for one team: this checkout's launcher, pinned to the session socket and the team dir.
+
+    The launcher is the one THIS platform can execute: the POSIX sh script
+    on unix, the ported ``.cmd`` on Windows. A spec that names the sh script
+    on Windows is a spec that cannot be run - the harness would start a file
+    the shell cannot execute (2026-10-21 port fix, W-22).
+    """
     return {
         "server": MCP_SERVER_NAME,
-        "command": os.path.abspath(os.fspath(plugin_root() / "bin" / CLI)),
+        "command": os.path.abspath(os.fspath(cli_launcher_path())),
         "args": ["--socket", os.path.abspath(os.fspath(layout.socket)), "--team", os.path.abspath(os.fspath(team.root)), "canvas", "mcp"],
     }
 
@@ -446,7 +453,15 @@ def is_preserved_mcp_value(kind: Any, flag: str, value: Any) -> bool:
         return False
     if flag == "--mcp-config":
         path = Path(value)
-        return path.is_absolute() and path.name == MCP_CONFIG_FILE and path.parent.name == WHITEBOARD_DIR
+        # Whether a path is absolute is a PLATFORM question - on Windows a
+        # path that starts with "/" is not - and the thing this guards is a
+        # string question: does it name Synapse's own canvas door? So on
+        # Windows it is answered as a string, and the unix branch keeps the
+        # platform's own answer (measured 2026-10-22: a POSIX-shaped config
+        # path was reported MISSING on Windows, so a launch that carried the
+        # canvas door was reported broken).
+        absolute = _compat.looks_absolute(value) if _compat.IS_WINDOWS else path.is_absolute()
+        return absolute and path.name == MCP_CONFIG_FILE and path.parent.name == WHITEBOARD_DIR
     if not value.startswith(CODEX_OVERRIDE_PREFIX) or "=" not in value:
         return False
     name = value[len(CODEX_OVERRIDE_PREFIX):].split("=", 1)[0]

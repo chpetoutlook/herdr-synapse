@@ -115,6 +115,90 @@ SOCKET_SOURCE_ENV_SOCKET = "env:HERDR_SOCKET_PATH"
 SOCKET_SOURCE_ENV_SESSION = "env:HERDR_SESSION"
 SOCKET_SOURCE_DEFAULT = "default"
 
+#: Herdr refuses a manifest with two actions or two panes of the same id,
+#: so the Windows entrypoints carry this suffix (``picker-windows``). The
+#: unix ids stay exactly as upstream.
+WINDOWS_ENTRYPOINT_SUFFIX = "-windows"
+
+
+def entrypoint_id(entrypoint: str) -> str:
+    """The manifest entrypoint id for this platform.
+
+    unix: the upstream id (``picker``). Windows: the same id with the
+    ``-windows`` suffix the Windows manifest entries carry.
+    """
+    if os.name == "nt":
+        return entrypoint + WINDOWS_ENTRYPOINT_SUFFIX
+    return entrypoint
+
+
+def entrypoint_matches(env: Mapping[str, str], entrypoint: str) -> bool:
+    """True when this process is the given plugin pane entrypoint.
+
+    Both ids are accepted (``picker`` and ``picker-windows``) so a pane
+    started by either manifest keeps working.
+    """
+    value = env.get("HERDR_PLUGIN_ENTRYPOINT_ID")
+    if not value:
+        return False
+    return value == entrypoint or value == entrypoint_id(entrypoint)
+
+
+#: The vendored Windows curses is an ABI-tagged wheel: ``_curses.cp312-win_amd64.pyd``
+#: loads only under the interpreter the tag names. When ``py -3`` resolves to a
+#: NEWER default Python (3.15 here, 2026-10-25) no popup can draw: every pane
+#: that runs ``import curses`` dies with an ImportError seconds after it is
+#: spawned, the popup closes, and the operator sees only a toast with exit
+#: code 1 that vanishes before it is readable. Naming the tag mismatch HERE,
+#: before the import, turns that crash into the one line that fixes it.
+VENDOR_CURSES_DIR = Path("vendor") / "win_curses"
+
+
+def vendor_curses_problem(env: Mapping[str, str]) -> Optional[str]:
+    """Why the vendored Windows curses cannot load here, or ``None``.
+
+    Forkless: reads only the vendored wheel tag off disk and compares it with
+    this interpreter's own ABI tag (``sys.version_info``). POSIX answers
+    ``None`` immediately - curses ships with the interpreter there.
+    """
+    if os.name != "nt":
+        return None
+    import sys as _sys
+
+    interpreter_tag = "cp{}{}".format(_sys.version_info.major, _sys.version_info.minor)
+    vendor_dir = plugin_root() / VENDOR_CURSES_DIR
+    vendored_tags: List[str] = []
+    tag_re = re.compile(r"^_curses(?:_panel)?\.([A-Za-z0-9_]+)-win_amd64\.pyd\Z")
+    if vendor_dir.is_dir():
+        for entry in sorted(vendor_dir.glob("_curses*-win_amd64.pyd")):
+            match = tag_re.match(entry.name)
+            if match:
+                vendored_tags.append(match.group(1))
+    if not vendored_tags:
+        return (
+            "the vendored Windows curses runtime is missing: {} holds no "
+            "_curses*-win_amd64.pyd, so no pane can draw; reinstall the plugin runtime".format(vendor_dir)
+        )
+    if interpreter_tag not in vendored_tags:
+        return (
+            "the vendored Windows curses runtime is {tags}; this interpreter is "
+            "{tag} ({python}), so every curses pane dies on import; set "
+            "HERDR_TEAM_PYTHON to a matching interpreter - for example the "
+            "Python 3.12 that carries windows-curses - and restart Herdr"
+        ).format(
+            tags=", ".join(sorted(set(vendored_tags))), tag=interpreter_tag,
+            python="{}.{}.{}".format(_sys.version_info.major, _sys.version_info.minor, _sys.version_info.micro),
+        )
+    return None
+
+
+def require_vendor_curses(env: Mapping[str, str]) -> None:
+    """Refuse with a NAMED error when the vendored curses cannot load here."""
+    problem = vendor_curses_problem(env)
+    if problem is not None:
+        raise HerdrTeamError("curses_runtime_unavailable", problem)
+
+
 DIR_MODE = 0o700
 FILE_MODE = 0o600
 
@@ -128,6 +212,21 @@ def plugin_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def cli_launcher_path() -> Path:
+    """The launcher this platform can actually execute.
+
+    unix: ``bin/herdr-synapse`` (the POSIX sh script). Windows: ``bin/herdr-synapse.cmd``
+    (the ported batch launcher).
+
+    Every hint that tells a human what to run - the ``cli:`` line, the
+    ``herdr-synapse resume <name>`` hint - must name a file that can be run
+    here, or the hint is a dead end: the sh script is not executable on
+    Windows. (2026-10-21 port fix.)
+    """
+    name = "herdr-synapse.cmd" if os.name == "nt" else "herdr-synapse"
+    return plugin_root() / "bin" / name
+
+
 def skill_file() -> Path:
     return plugin_root() / "skills" / PLUGIN_ID / "SKILL.md"
 
@@ -138,7 +237,19 @@ def skill_guides_dir() -> Path:
 
 
 def home_dir(env: Mapping[str, str]) -> Path:
+    """The user's home directory.
+
+    ``HOME`` is unset on Windows in many shells, so ``USERPROFILE`` is the
+    fallback there; ``HOMEDRIVE``/``HOMEPATH`` is the last resort.
+    """
     home = env.get("HOME")
+    if not home and os.name == "nt":
+        home = env.get("USERPROFILE")
+    if not home and os.name == "nt":
+        drive = env.get("HOMEDRIVE")
+        path = env.get("HOMEPATH")
+        if drive and path:
+            home = drive + path
     if not home:
         raise HerdrTeamError("home_unset", "HOME is not set and no XDG override applies", EXIT_REFUSED)
     return Path(home)
@@ -150,17 +261,36 @@ def app_dir_name(env: Mapping[str, str]) -> str:
 
 
 def config_dir(env: Mapping[str, str]) -> Path:
-    """Herdr's config dir as the CLI would compute it from this env."""
+    """Herdr's config dir as the CLI would compute it from this env.
+
+    unix: ``$XDG_CONFIG_HOME/<app>`` or ``~/.config/<app>``.
+    Windows: ``%APPDATA%\\<app>`` (where Herdr itself keeps its config on
+    Windows), falling back to ``~/.config/<app>`` when ``APPDATA`` is unset.
+    """
     xdg = env.get("XDG_CONFIG_HOME")
     if xdg:
         return Path(xdg) / app_dir_name(env)
+    if os.name == "nt":
+        appdata = env.get("APPDATA")
+        if appdata:
+            return Path(appdata) / app_dir_name(env)
     return home_dir(env) / ".config" / app_dir_name(env)
 
 
 def xdg_state_home(env: Mapping[str, str]) -> Path:
+    """Where per-user state lives.
+
+    unix: ``$XDG_STATE_HOME`` or ``~/.local/state``.
+    Windows: ``%LOCALAPPDATA%`` (the Windows counterpart of the XDG state
+    dir), falling back to ``~/.local/state``.
+    """
     xdg = env.get("XDG_STATE_HOME")
     if xdg:
         return Path(xdg)
+    if os.name == "nt":
+        local = env.get("LOCALAPPDATA")
+        if local:
+            return Path(local)
     return home_dir(env) / ".local" / "state"
 
 
@@ -170,8 +300,16 @@ def canonicalize(path: "os.PathLike[str] | str") -> Path:
 
 
 def looks_like_path(value: str) -> bool:
-    """``--team`` and ``HERDR_TEAM_DIR`` take either a team name or a path."""
-    return "/" in value or value.startswith(".") or value.startswith("~")
+    """``--team`` and ``HERDR_TEAM_DIR`` take either a team name or a path.
+
+    On Windows a path may be written with backslashes and a drive letter
+    (``C:\\teams\\alpha``), so those count as paths too.
+    """
+    if "/" in value or value.startswith(".") or value.startswith("~"):
+        return True
+    if os.name == "nt" and ("\\" in value or (len(value) > 1 and value[1] == ":")):
+        return True
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -453,6 +591,18 @@ class TeamPaths:
     name: str
 
     @property
+    def session_paths(self) -> "SessionPaths":
+        """The session this team belongs to.
+
+        A team lives at ``<session>/teams/<team>``, so the session root is two
+        levels up and its slug is the directory name. What this buys: code that
+        has only the team's paths can still reach the session-wide state (the
+        operator grants), which is what decides whether a seat holds the
+        operator's authority.
+        """
+        return SessionPaths(root=self.root.parent.parent, slug=self.root.parent.name)
+
+    @property
     def team_json(self) -> Path:
         return self.root / "team.json"
 
@@ -555,6 +705,11 @@ class TeamPaths:
         return self.notifier_dir / "state.json"
 
     @property
+    def manager_nudge_state(self) -> Path:
+        """What the daemon last reported to each member: so a restart does not re-report it."""
+        return self.notifier_dir / "manager_nudge.json"
+
+    @property
     def human_attention(self) -> Path:
         return self.notifier_dir / "human-attention.jsonl"
 
@@ -652,6 +807,11 @@ class SessionPaths:
     @property
     def links_lock(self) -> Path:
         return self.root / "links.lock"
+
+    @property
+    def superuser_designations_json(self) -> Path:
+        """Server-local superuser pane/session designation registry (W-16 designated superuser pane/session feature)."""
+        return self.root / "superuser_designations.json"
 
     @property
     def panes_dir(self) -> Path:

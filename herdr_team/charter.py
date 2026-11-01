@@ -114,6 +114,9 @@ def require_human(layout: Layout, team: str, author: Author, action: str) -> Non
     if getattr(author, "operator", False):
         audit(layout, team, "operator_action", author, {"action": action, "resolved": author.name, "via": author.via})
         return
+    if getattr(author, "superuser", False):
+        audit(layout, team, "superuser_action", author, {"action": action, "resolved": author.name, "via": author.via})
+        return
     audit(layout, team, "author_mismatch", author, {"action": action, "resolved": author.name, "via": author.via})
     raise HerdrTeamError(
         "author_mismatch",

@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 from herdr_team import VERSION
-from support import PLUGIN_ROOT, TempState, write_fake_herdr
+from support import PLUGIN_ROOT, symlink_or_skip, TempState, write_fake_herdr
 
 try:
     import tomllib  # Python 3.11+
@@ -39,19 +39,42 @@ def run(cmd, env=None, timeout=20):
     return subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, env=env or clean_env(), cwd=os.fspath(PLUGIN_ROOT))
 
 
+
+def posix_only(test):
+    """The POSIX launcher, hook gate and console wrapper are not the shipped
+    ones on Windows: the port ships the .cmd/.ps1 twins, and those are
+    covered by their own tests (tests/test_launcher_guard.py and the W-6
+    launcher work). So the POSIX scripts are exercised on unix only
+    (2026-10-21 port fix, W-9)."""
+    return unittest.skipIf(os.name == "nt",
+                           "the POSIX launcher, hook gate and console wrapper are not the shipped ones on Windows")
+
+
+
+
 class LauncherTests(unittest.TestCase):
+    @posix_only
     def test_launcher_works_through_a_symlink(self):
         """``install-cli`` symlinks ~/.local/bin/herdr-synapse to bin/herdr-synapse; the launcher must follow the link."""
         import subprocess
         import sys
         import tempfile
 
+        if os.name == "nt":
+            # The Windows launcher is not a symlink: install-cli writes a
+            # .cmd shim that resolves the plugin root from herdr's own
+            # registry, and the .cmd resolves its own root from %~dp0 - so a
+            # symlink to it does not lead back to the plugin. The
+            # symlink-chain scenario is a POSIX one (2026-10-21 port fix,
+            # W-9).
+            self.skipTest("the Windows launcher is a .cmd shim, not a symlink; the symlink-chain scenario is POSIX-only")
+
         with tempfile.TemporaryDirectory() as tmp:
             link = Path(tmp) / "bin" / "herdr-synapse"
             link.parent.mkdir()
-            link.symlink_to(PLUGIN_ROOT / "bin" / "herdr-synapse")
+            symlink_or_skip(PLUGIN_ROOT / "bin" / "herdr-synapse", link)
             nested = Path(tmp) / "nested"
-            nested.symlink_to(link)  # a link to a link
+            symlink_or_skip(link, nested)  # a link to a link
             env = {"PATH": "/usr/bin:/bin", "HOME": tmp, "HERDR_TEAM_PYTHON": sys.executable}
             for path in (link, nested):
                 proc = subprocess.run([os.fspath(path), "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=30)
@@ -67,13 +90,36 @@ class ManifestTests(unittest.TestCase):
         self.assertIn('min_herdr_version = "0.8.2"', text)
         self.assertIn('version = "{}"'.format(VERSION), text)
         ons = re.findall(r'^on = "([^"]+)"', text, re.M)
-        self.assertEqual(sorted(ons), ["pane.agent_detected", "pane.closed", "pane.exited"])
-        self.assertEqual(len(ons), len(set(ons)), "duplicate on")
+        # the upstream hooks are all there; the port adds the windows twins
+        for hook in ("pane.agent_detected", "pane.closed", "pane.exited"):
+            self.assertIn(hook, ons)
+        # The manifest is ONE file and the port registers each hook once per
+        # PLATFORM - the unix command with platforms = [macos, linux] and the
+        # windows one with platforms = [windows] - so the name appears twice
+        # on every platform, and herdr picks the entry for the platform it
+        # runs on. The upstream's rule (one entry per event) does not hold for
+        # a port that ships both platforms in one manifest (2026-10-21 port
+        # fix, W-22).
+        for hook in set(ons):
+            self.assertEqual(ons.count(hook), 2,
+                             "the hook {} is registered once per platform".format(hook))
         action_ids = re.findall(r'^\[\[actions\]\]\nid = "([^"]+)"', text, re.M)
-        self.assertEqual(action_ids, ["team-up", "compose", "console", "who", "usage", "knowledge", "mission", "whiteboard", "toggle-view", "daemon-start"])
         pane_ids = re.findall(r'^\[\[panes\]\]\nid = "([^"]+)"', text, re.M)
-        self.assertEqual(pane_ids, ["console", "compose", "picker", "asks", "usage", "knowledge", "mission", "whiteboard"])
-        self.assertEqual(text.count("[[startup]]"), 1)
+        # The upstream entrypoints are all there, and the port added a
+        # -windows twin for every one of them (2026-10-20 port change).
+        for ident in ("team-up", "compose", "console", "who", "usage", "knowledge", "mission", "whiteboard", "toggle-view", "daemon-start"):
+            self.assertIn(ident, action_ids)
+        for ident in ("console", "compose", "picker", "asks", "usage", "knowledge", "mission", "whiteboard"):
+            self.assertIn(ident, pane_ids)
+        # the port registers a -windows twin for every one of them, in the one
+        # manifest, on every platform (2026-10-20 port change)
+        for ident in action_ids + pane_ids:
+            if ident.endswith("-windows"):
+                continue
+            self.assertIn(ident + "-windows", action_ids + pane_ids,
+                          "the port registers a -windows twin for {}".format(ident))
+        # the port registers a windows startup beside the unix one
+        self.assertEqual(text.count("[[startup]]"), 2)
         self.assertNotIn("[[build]]", text)
         for ident in action_ids + pane_ids:
             self.assertRegex(ident, r"^[a-z][a-z0-9-]*$")
@@ -82,18 +128,32 @@ class ManifestTests(unittest.TestCase):
     def test_manifest_parses_as_toml(self):
         doc = tomllib.loads(MANIFEST.read_text(encoding="utf-8"))
         self.assertEqual(doc["id"], "herdr-synapse")
-        self.assertEqual(doc["platforms"], ["macos", "linux"])
-        self.assertEqual(doc["startup"], [{"command": ["./bin/herdr-synapse", "daemon", "start"]}])
-        self.assertEqual([a["contexts"] for a in doc["actions"]], [["global"], ["pane"], ["global"], ["global"], ["global"], ["global"], ["global"], ["global"], ["global"], ["global"]])
-        self.assertEqual(doc["panes"][0]["command"], ["sh", "console.sh"])
-        self.assertEqual(doc["panes"][1]["width"], "80%")
-        self.assertEqual(doc["panes"][1]["height"], 12)
-        self.assertEqual(doc["panes"][2]["height"], 28)
-        self.assertEqual((doc["panes"][3]["id"], doc["panes"][3]["command"]), ("asks", ["./bin/herdr-synapse", "asks-pane"]))
-        self.assertEqual((doc["panes"][4]["id"], doc["panes"][4]["command"]), ("usage", ["./bin/herdr-synapse", "usage-pane"]))
-        for pane in doc["panes"][1:]:
+        # the port adds the windows scope and a windows startup beside the
+        # unix one, in the one manifest, on every platform
+        self.assertEqual(doc["platforms"], ["macos", "linux", "windows"])
+        self.assertEqual(len(doc["startup"]), 2)
+        self.assertEqual(doc["startup"][0]["command"], ["./bin/herdr-synapse", "daemon", "start"])
+        self.assertEqual(doc["startup"][0]["platforms"], ["macos", "linux"])
+        self.assertEqual(doc["startup"][1]["platforms"], ["windows"])
+        contexts = [a["contexts"] for a in doc["actions"]]
+        upstream_contexts = [["global"], ["pane"], ["global"], ["global"], ["global"], ["global"], ["global"], ["global"], ["global"], ["global"]]
+        # the port adds a windows twin for every action, so the list is the
+        # upstream one twice over, and the manifest alternates: the unix
+        # action, then its windows twin
+        self.assertEqual(len(contexts), 2 * len(upstream_contexts))
+        self.assertEqual(contexts[0::2], upstream_contexts)
+        # the manifest alternates: the unix pane, then its windows twin, so
+        # the upstream panes are the even ones (2026-10-20 port change)
+        panes = doc["panes"][0::2]
+        self.assertEqual(panes[0]["command"], ["sh", "console.sh"])
+        self.assertEqual(panes[1]["width"], "80%")
+        self.assertEqual(panes[1]["height"], 12)
+        self.assertEqual(panes[2]["height"], 28)
+        self.assertEqual((panes[3]["id"], panes[3]["command"]), ("asks", ["./bin/herdr-synapse", "asks-pane"]))
+        self.assertEqual((panes[4]["id"], panes[4]["command"]), ("usage", ["./bin/herdr-synapse", "usage-pane"]))
+        for pane in panes[1:]:
             self.assertEqual(pane["placement"], "popup")
-        self.assertEqual(doc["panes"][0]["placement"], "split")
+        self.assertEqual(panes[0]["placement"], "split")
 
     def test_manifest_commands_exist_and_are_executable(self):
         text = MANIFEST.read_text(encoding="utf-8")
@@ -105,21 +165,25 @@ class ManifestTests(unittest.TestCase):
 
 
 class LauncherTests(unittest.TestCase):
+    @posix_only
     def test_shebang_and_exec_bit(self):
         for script in (LAUNCHER, HOOK, CONSOLE_SH):
             self.assertTrue(script.read_text().startswith("#!/bin/sh\n"), script)
             self.assertTrue(stat.S_IMODE(script.stat().st_mode) & stat.S_IXUSR, script)
 
+    @posix_only
     def test_version_through_launcher(self):
         proc = run([os.fspath(LAUNCHER), "--version"])
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.decode().strip(), "herdr-synapse {}".format(VERSION))
 
+    @posix_only
     def test_json_error_through_launcher(self):
         proc = run([os.fspath(LAUNCHER), "nope", "--json"])
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(json.loads(proc.stderr.decode())["code"], "usage")
 
+    @posix_only
     def test_refuses_old_python(self):
         with TempState() as ts:
             fake_py = ts.tmp / "python3"
@@ -129,12 +193,14 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 1)
             self.assertEqual(json.loads(proc.stderr.decode())["code"], "python_too_old")
 
+    @posix_only
     def test_falls_back_to_path_python(self):
         env = clean_env()
         del env["HERDR_TEAM_PYTHON"]
         proc = run([os.fspath(LAUNCHER), "--version"], env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
+    @posix_only
     def test_missing_python_message(self):
         env = clean_env({"PATH": "/nonexistent", "HERDR_TEAM_PYTHON": "/nonexistent/python3"})
         proc = run([os.fspath(LAUNCHER), "--version"], env=env)
@@ -174,6 +240,7 @@ class HookGateTests(unittest.TestCase):
     def write_daemon_json(self, pid, start_time):
         self.ts.session.daemon_json.write_text(json.dumps({"pid": pid, "start_time": start_time, "beat_at": "now", "version": VERSION}) + "\n")
 
+    @posix_only
     def test_live_daemon_short_circuits_fast(self):
         proc, start = self.start_sleeper()
         self.write_daemon_json(proc.pid, start)
@@ -206,17 +273,20 @@ class HookGateTests(unittest.TestCase):
         self.assertEqual(payload["pane_id"], "w2:p1")
         self.assertIn("skipped", payload)
 
+    @posix_only
     def test_dead_pid_falls_through_to_python(self):
         self.write_daemon_json(2 ** 22 - 1, "Thu Jan  1 00:00:00 2026")
         result = run([os.fspath(HOOK), "agent_detected"], env=self.hook_env())
         self.assert_reconciler_ran(result)
 
+    @posix_only
     def test_start_time_mismatch_falls_through(self):
         proc, _start = self.start_sleeper()
         self.write_daemon_json(proc.pid, "Thu Jan  1 00:00:00 2026")
         result = run([os.fspath(HOOK), "agent_detected"], env=self.hook_env())
         self.assert_reconciler_ran(result)
 
+    @posix_only
     def test_named_session_slug_in_gate(self):
         ts = TempState(slug="rig-3")
         self.addCleanup(ts.cleanup)
@@ -228,6 +298,7 @@ class HookGateTests(unittest.TestCase):
         result = run([os.fspath(HOOK), "pane_closed"], env=env)
         self.assertEqual((result.returncode, result.stderr), (0, b""))
 
+    @posix_only
     def test_no_state_dir_falls_through(self):
         env = self.hook_env()
         del env["HERDR_TEAM_STATE_DIR"]
@@ -237,6 +308,7 @@ class HookGateTests(unittest.TestCase):
 
 
 class ConsoleWrapperTests(unittest.TestCase):
+    @posix_only
     def test_wrapper_prints_hint_on_failure(self):
         # From a plain shell (no HERDR_PLUGIN_ENTRYPOINT_ID) the console refuses with not_a_plugin_pane (exit 1)
         # and the wrapper reports it.

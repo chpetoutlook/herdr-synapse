@@ -12,6 +12,7 @@ import urllib.error
 from unittest import mock
 
 from herdr_team.native_transport import JsonLines, NativeError, OpenCodeServer, _stop_owned, metadata_command
+from support import requires_posix
 
 
 class Lines(unittest.TestCase):
@@ -44,12 +45,17 @@ class Lines(unittest.TestCase):
                 stream.send({"method": "initialize"})
 
 
+    # The product's own kill seam is ``kill_process_group`` - it exists on
+    # both platforms (the unix branch calls ``os.killpg``; the Windows branch
+    # kills the tree with ``taskkill /T``).  Patching ``os.killpg`` itself
+    # is POSIX-only: on Windows the attribute does not exist, so the patch
+    # raised AttributeError before the test ran (2026-10-22, W-46).
 class CommandBounds(unittest.TestCase):
     def test_permission_error_before_exit_status_settles_reaps_only_owned_group(self):
         proc = mock.Mock(pid=12345)
         proc.poll.side_effect = [None, None, 0, 0]
         proc.wait.return_value = 0
-        with mock.patch("herdr_team.native_transport.os.killpg", side_effect=PermissionError) as kill:
+        with mock.patch("herdr_team.native_transport.kill_process_group", side_effect=PermissionError) as kill:
             _stop_owned(proc)
         self.assertEqual([call.args[0] for call in kill.call_args_list], [12345, 12345])
         proc.wait.assert_called()
@@ -58,34 +64,47 @@ class CommandBounds(unittest.TestCase):
         proc = mock.Mock(pid=12345)
         proc.poll.return_value = None
         proc.wait.side_effect = subprocess.TimeoutExpired("owned-child", 2)
-        with mock.patch("herdr_team.native_transport.os.killpg", side_effect=PermissionError):
+        with mock.patch("herdr_team.native_transport.kill_process_group", side_effect=PermissionError):
             with self.assertRaises(PermissionError):
                 _stop_owned(proc)
 
     def test_metadata_command_bounds_output_before_buffering_everything(self):
         with tempfile.TemporaryDirectory() as cwd:
-            self.assertEqual(metadata_command([sys.executable, "-c", 'print("metadata")'], cwd, dict(os.environ), time.monotonic() + 10), "metadata\n")
+            # The CHILD writes the platform's newline: its stdout is a pipe in text
+            # mode, so on Windows it is "metadata\\r\\n".  The product reads
+            # the bytes faithfully - it must not translate, because the
+            # output may be binary - so the expectation is the platform's
+            # newline (2026-10-22, W-47).
+            self.assertEqual(
+                metadata_command([sys.executable, "-c", 'print("metadata")'], cwd,
+                                dict(os.environ), time.monotonic() + 10),
+                "metadata" + os.linesep)
             with self.assertRaisesRegex(NativeError, "native_frame_too_large"):
                 metadata_command([sys.executable, "-c", 'import sys; sys.stdout.write("x" * (9 * 1024 * 1024))'], cwd, dict(os.environ), time.monotonic() + 10)
 
     def test_exited_parent_does_not_skip_private_group_cleanup(self):
         proc = mock.Mock(pid=12345, returncode=0)
-        with mock.patch("herdr_team.native_transport.os.killpg") as kill:
+        with mock.patch("herdr_team.native_transport.kill_process_group") as kill:
             _stop_owned(proc)
         self.assertEqual([call.args[0] for call in kill.call_args_list], [12345, 12345])
 
     def test_darwin_exited_group_permission_error_is_reaped_not_retried_elsewhere(self):
         proc = mock.Mock(pid=12345, returncode=0)
         proc.poll.return_value = 0
-        with mock.patch("herdr_team.native_transport.os.killpg", side_effect=PermissionError):
+        with mock.patch("herdr_team.native_transport.kill_process_group", side_effect=PermissionError):
             _stop_owned(proc)
         proc.wait.assert_called()
         proc.poll.return_value = None
-        with mock.patch("herdr_team.native_transport.os.killpg", side_effect=PermissionError):
+        with mock.patch("herdr_team.native_transport.kill_process_group", side_effect=PermissionError):
             with self.assertRaises(PermissionError):
                 _stop_owned(proc)
 
     def test_descendant_holding_pipe_after_parent_exit_is_closed(self):
+        # The child script FORKS, which is POSIX-only: Windows has no fork,
+        # so the descendant that holds the pipe open cannot be created there.
+        # The check is for the PLATFORM, so the unix run still exercises it
+        # (2026-10-22, W-47).
+        requires_posix("the child script forks, and Windows has no fork")
         source = 'import os,sys,signal,json; pid=os.fork();\nif pid: os._exit(0)\nsignal.signal(signal.SIGTERM, signal.SIG_IGN); print(json.dumps({"child":os.getpid()}), flush=True); sys.stdin.read()'
         with tempfile.TemporaryDirectory() as cwd:
             stream = JsonLines([sys.executable, "-u", "-c", source], cwd, dict(os.environ))
@@ -105,7 +124,7 @@ class PrivateHttp(unittest.TestCase):
         http = mock.Mock()
         response = io.BytesIO(b'{"all":[],"connected":[]}')
         http.open.side_effect = [urllib.error.HTTPError("http://local", 401, "auth required", {}, None), response]
-        with mock.patch("herdr_team.native_transport.subprocess.Popen", return_value=proc) as launch, mock.patch("herdr_team.native_transport.urllib.request.build_opener", return_value=http), mock.patch("herdr_team.native_transport.os.killpg") as stop:
+        with mock.patch("herdr_team.native_transport.subprocess.Popen", return_value=proc) as launch, mock.patch("herdr_team.native_transport.urllib.request.build_opener", return_value=http), mock.patch("herdr_team.native_transport.kill_process_group") as stop:
             with OpenCodeServer("fixture", "/tmp", {}) as server:
                 self.assertEqual(server.request("/provider"), {"all": [], "connected": []})
                 with self.assertRaisesRegex(NativeError, "metadata_method_refused"):
@@ -121,7 +140,7 @@ class PrivateHttp(unittest.TestCase):
         proc.poll.return_value = None
         http = mock.Mock()
         http.open.return_value = io.BytesIO(b"unauthenticated response")
-        with mock.patch("herdr_team.native_transport.subprocess.Popen", return_value=proc), mock.patch("herdr_team.native_transport.urllib.request.build_opener", return_value=http), mock.patch("herdr_team.native_transport.os.killpg"):
+        with mock.patch("herdr_team.native_transport.subprocess.Popen", return_value=proc), mock.patch("herdr_team.native_transport.urllib.request.build_opener", return_value=http), mock.patch("herdr_team.native_transport.kill_process_group"):
             with OpenCodeServer("fixture", "/tmp", {}) as server:
                 with self.assertRaisesRegex(NativeError, "native_authentication_unsupported"):
                     server.request("/provider")

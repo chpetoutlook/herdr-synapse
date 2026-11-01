@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from herdr_team import charter, cli, document_sync as sync, roster, store, workdir
 from test_workdir import human
-from support import TempState
+from support import is_root, symlink_or_skip, TempState
 
 
 class DocumentSyncTests(unittest.TestCase):
@@ -119,7 +119,7 @@ class DocumentSyncTests(unittest.TestCase):
         workdir.render(self.layout, self.team)
         self.assertEqual(self.member.read_bytes(), b"\xff")
         self.member.unlink()
-        self.member.symlink_to(self.files["knowledge"])
+        symlink_or_skip(self.files["knowledge"], self.member)
         self.assertTrue(sync.scan(self.layout, self.team)["errors"])
         workdir.render(self.layout, self.team)
         self.assertTrue(self.member.is_symlink())
@@ -361,14 +361,17 @@ class NeverOverwriteTests(NeverOverwriteFixture, unittest.TestCase):
             self.plant(self.inherited(), b"not a directory")
 
         def a_symlink():
-            os.symlink(os.fspath(self.project / "elsewhere"), os.fspath(self.inherited()))
+            symlink_or_skip(os.fspath(self.project / "elsewhere"), os.fspath(self.inherited()))
 
         def read_only():
             self.inherited().mkdir(parents=True)
             os.chmod(self.inherited(), 0o555)
 
         blockers = [("a file at inherited", a_file), ("a symlink at inherited", a_symlink)]
-        if os.getuid() != 0:
+        if not is_root() and os.name != "nt":
+            # Windows has no POSIX mode bits for a DIRECTORY: chmod 0o555 does
+            # not make it unwritable, so there is no read-only blocker to
+            # plant here (2026-10-21 port fix, W-9).
             blockers.append(("a read-only inherited", read_only))
         self.addCleanup(self._clear_root)
         for label, block in blockers:
@@ -502,7 +505,7 @@ class NeverOverwriteTests(NeverOverwriteFixture, unittest.TestCase):
         elsewhere.mkdir()
         (elsewhere / "main.py").write_bytes(b"print('the repository')\n")
         self.files["root"].mkdir(parents=True, exist_ok=True)
-        os.symlink(os.fspath(elsewhere), os.fspath(self.files["canvas_assets"]))
+        symlink_or_skip(os.fspath(elsewhere), os.fspath(self.files["canvas_assets"]))
         guard = sync.FolderGuard(self.layout, self.team, self.files)
         out = workdir.prune_canvas_assets(guard, self.files["canvas_assets"], [])
         self.assertIn("symlink", out["refused"])

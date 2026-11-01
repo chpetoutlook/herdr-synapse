@@ -22,13 +22,16 @@ ack, then one event line per tick.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import shutil
 import socket
+import stat
 import tempfile
 import threading
 import time
+import unittest
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
@@ -435,6 +438,16 @@ class TempState:
 ResponseSpec = Union[Dict[str, Any], Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]]
 
 
+def is_root() -> bool:
+    """True when the test process runs as root.
+
+    Windows has no root concept, so this is always False there; the unix
+    behaviour it gates is unchanged (2026-10-21 port fix).
+    """
+    getuid = getattr(os, "getuid", None)
+    return bool(getuid is not None and getuid() == 0)
+
+
 class FakeHerdrServer:
     """Threaded NDJSON Unix-socket server replaying canned responses."""
 
@@ -457,7 +470,7 @@ class FakeHerdrServer:
         self.requests: List[Dict[str, Any]] = []
         self.connections = 0
         self._stop = threading.Event()
-        self._listener: Optional[socket.socket] = None
+        self._listener: Optional[Any] = None
         self._thread: Optional[threading.Thread] = None
         self._workers: List[threading.Thread] = []
         self._lock = threading.Lock()
@@ -489,6 +502,13 @@ class FakeHerdrServer:
     # lifecycle ---------------------------------------------------------------
 
     def start(self) -> "FakeHerdrServer":
+        if os.name == "nt":
+            # Windows has no AF_UNIX: the fake server listens on the named pipe
+            # the product's transport opens (2026-10-21 port fix).
+            self._listener = _WindowsPipeListener(self.socket_path)
+            self._thread = threading.Thread(target=self._accept_loop, name="fake-herdr-accept", daemon=True)
+            self._thread.start()
+            return self
         try:
             os.unlink(self.socket_path)
         except FileNotFoundError:
@@ -505,8 +525,15 @@ class FakeHerdrServer:
 
     def stop(self) -> None:
         self._stop.set()
+        if isinstance(self._listener, _WindowsPipeListener):
+            # A pending ConnectNamedPipe blocks the accept thread; connecting a
+            # throwaway client releases it so the thread can finish.
+            self._listener.release()
         if self._thread is not None:
-            self._thread.join(timeout=2.0)
+            # The Windows accept thread can sit in a pipe wait; it is a daemon,
+            # so joining it briefly is enough - the process must not wait for a
+            # pipe that no client is going to take (2026-10-21 port fix).
+            self._thread.join(timeout=0.5 if os.name == "nt" else 2.0)
         for worker in list(self._workers):
             worker.join(timeout=2.0)
         if self._listener is not None:
@@ -536,9 +563,21 @@ class FakeHerdrServer:
                 conn, _ = self._listener.accept()
             except socket.timeout:
                 continue
+            except _PipeAcceptTimeout:
+                # No client yet (Windows): retry until the stop flag is set.
+                continue
             except OSError:
                 return
             self.connections += 1
+            if self._stop.is_set():
+                # The stop flag was set while this connection was being
+                # accepted (the release() client): close it instead of
+                # serving it (2026-10-21 port fix).
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                return
             worker = threading.Thread(target=self._serve, args=(conn,), daemon=True)
             self._workers.append(worker)
             worker.start()
@@ -608,12 +647,239 @@ class FakeHerdrServer:
                 return
 
     @staticmethod
-    def _write(conn: socket.socket, obj: Dict[str, Any]) -> bool:
+    def _write(conn: Any, obj: Dict[str, Any]) -> bool:
         try:
             conn.sendall((json.dumps(obj) + "\n").encode("utf-8"))
             return True
         except OSError:
             return False
+
+
+# --------------------------------------------------------------------------
+# Windows named-pipe fake server
+# --------------------------------------------------------------------------
+#
+# The product's transport on Windows is a Win32 named pipe whose name is the
+# socket path verbatim behind the ``\\.\pipe\`` prefix, so the fake Herdr
+# server has to listen there for the integration tests to exercise the real
+# transport (2026-10-21 port fix). These helpers are the server side of that
+# pipe, written with the same Win32 calls the product's client uses.
+
+_PIPE_ACCESS_DUPLEX = 0x00000003
+_PIPE_TYPE_BYTE = 0x00000000
+_PIPE_READMODE_BYTE = 0x00000000
+_PIPE_WAIT = 0x00000000
+_PIPE_UNLIMITED_INSTANCES = 255
+_FILE_FLAG_OVERLAPPED = 0x40000000
+_ERROR_PIPE_CONNECTED = 535
+_ERROR_PIPE_LISTENING = 536
+_ERROR_IO_PENDING = 997
+_INVALID_HANDLE_VALUE = -1
+
+
+class _PipeAcceptTimeout(Exception):
+    """No client connected within the accept window - the loop may retry."""
+
+
+class _OVERLAPPED(ctypes.Structure):
+    """The Win32 OVERLAPPED structure (ctypes.wintypes has no OVERLAPPED)."""
+
+    _fields_ = [
+        ("Internal", ctypes.c_size_t),
+        ("InternalHigh", ctypes.c_size_t),
+        ("Offset", ctypes.c_ulong),
+        ("OffsetHigh", ctypes.c_ulong),
+        ("hEvent", ctypes.c_void_p),
+    ]
+
+
+def _pipe_kernel32() -> Any:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateNamedPipeW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+    ]
+    kernel32.CreateNamedPipeW.restype = wintypes.HANDLE
+    kernel32.ConnectNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    kernel32.ConnectNamedPipe.restype = wintypes.BOOL
+    kernel32.ReadFile.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+    ]
+    kernel32.ReadFile.restype = wintypes.BOOL
+    kernel32.WriteFile.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+    ]
+    kernel32.WriteFile.restype = wintypes.BOOL
+    kernel32.DisconnectNamedPipe.argtypes = [wintypes.HANDLE]
+    kernel32.DisconnectNamedPipe.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, ctypes.c_void_p]
+    kernel32.CreateEventW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CancelIo.argtypes = [wintypes.HANDLE]
+    kernel32.CancelIo.restype = wintypes.BOOL
+    return kernel32
+
+
+class _WindowsPipeConn:
+    """A connected named pipe, shaped like the socket the unix rig hands around."""
+
+    def __init__(self, handle: int) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self._handle = handle
+        self._kernel32 = _pipe_kernel32()
+        self._buffer = b""
+        self._closed = False
+
+    def settimeout(self, _timeout: Optional[float]) -> None:
+        """A pipe handle has no socket-style timeout; the read is bounded by the caller's stop flag."""
+        return None
+
+    def makefile(self, _mode: str) -> "_WindowsPipeConn":
+        return self
+
+    def readline(self, limit: int = -1) -> bytes:
+        while b"\n" not in self._buffer:
+            chunk = self._read(4096)
+            if not chunk:
+                break
+            self._buffer += chunk
+            if limit and limit > 0 and len(self._buffer) > limit:
+                break
+        if b"\n" in self._buffer:
+            line, _, rest = self._buffer.partition(b"\n")
+            self._buffer = rest
+            return line + b"\n"
+        line, self._buffer = self._buffer, b""
+        return line
+
+    def _read(self, size: int) -> bytes:
+        buffer = self._ctypes.create_string_buffer(size)
+        count = self._wintypes.DWORD()
+        ok = self._kernel32.ReadFile(self._handle, buffer, size, self._ctypes.byref(count), None)
+        if not ok:
+            raise OSError(5, "read from the fake pipe failed")
+        return buffer.raw[: count.value]
+
+    def sendall(self, data: bytes) -> None:
+        view = memoryview(data)
+        sent = 0
+        while sent < len(view):
+            chunk = bytes(view[sent:])
+            buffer = self._ctypes.create_string_buffer(chunk, len(chunk))
+            count = self._wintypes.DWORD()
+            ok = self._kernel32.WriteFile(self._handle, buffer, len(chunk), self._ctypes.byref(count), None)
+            if not ok:
+                raise OSError(5, "write to the fake pipe failed")
+            sent += count.value
+
+    def recv(self, size: int) -> bytes:
+        return self._read(size)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # NOT DisconnectNamedPipe: that discards whatever the client has not
+        # read yet, and the response is usually still in the pipe when the
+        # server closes its end - the client would see a broken pipe instead
+        # of the answer (2026-10-21 port fix). Closing the handle is enough:
+        # the client reads the buffered bytes and then sees EOF.
+        try:
+            self._kernel32.CloseHandle(self._handle)
+        except OSError:
+            pass
+
+
+class _WindowsPipeListener:
+    """Accepts connections on the named pipe the product's transport opens."""
+
+    def __init__(self, socket_path: Union[str, Path]) -> None:
+        self.name = "\\\\.\\pipe\\" + os.fspath(socket_path)
+        self._kernel32 = _pipe_kernel32()
+        self._pending: Optional[int] = None
+
+    def accept(self) -> Any:
+        import ctypes
+        from ctypes import wintypes
+
+        # The instance is created OVERLAPPED so ConnectNamedPipe can be given a
+        # timeout: the accept loop then notices the stop flag instead of
+        # blocking forever in a wait that no client will ever satisfy (the
+        # unix rig got this for free - a socket accept with a timeout).
+        handle = self._kernel32.CreateNamedPipeW(
+            self.name,
+            _PIPE_ACCESS_DUPLEX | _FILE_FLAG_OVERLAPPED,
+            _PIPE_TYPE_BYTE | _PIPE_READMODE_BYTE | _PIPE_WAIT,
+            _PIPE_UNLIMITED_INSTANCES,
+            65536,
+            65536,
+            0,
+            None,
+        )
+        value = handle.value if hasattr(handle, "value") else handle
+        if value is None or int(value) == _INVALID_HANDLE_VALUE:
+            raise OSError("cannot create the fake pipe {}".format(self.name))
+        self._pending = int(value)
+
+        overlapped = _OVERLAPPED()
+        event = self._kernel32.CreateEventW(None, True, False, None)
+        overlapped.hEvent = event
+        connected = self._kernel32.ConnectNamedPipe(self._pending, ctypes.byref(overlapped))
+        if not connected:
+            code = ctypes.get_last_error()
+            if code == _ERROR_IO_PENDING:
+                waited = self._kernel32.WaitForSingleObject(event, 200)
+                if waited != 0:
+                    # timed out: no client yet - close the instance and let the
+                    # caller retry. Leaving it open would leak one pipe
+                    # instance per attempt until the pipe runs out of them
+                    # (2026-10-21 port fix).
+                    self._kernel32.CancelIo(self._pending)
+                    self._kernel32.CloseHandle(event)
+                    self._kernel32.CloseHandle(self._pending)
+                    self._pending = None
+                    raise _PipeAcceptTimeout()
+                connected = True
+            elif code == _ERROR_PIPE_CONNECTED:
+                connected = True
+            else:
+                self._kernel32.CloseHandle(event)
+                self._kernel32.CloseHandle(self._pending)
+                self._pending = None
+                raise OSError(code, "ConnectNamedPipe failed for {}".format(self.name))
+        self._kernel32.CloseHandle(event)
+        return _WindowsPipeConn(self._pending), None
+
+    def release(self) -> None:
+        """No pending accept to release: the accept loop times out on its own."""
+        return None
+
+    def close(self) -> None:
+        """The socket rig closes its listener; the pipe rig closes the pending instance."""
+        if self._pending is None:
+            return
+        try:
+            self._kernel32.CloseHandle(self._pending)
+        except OSError:
+            pass
+        self._pending = None
 
 
 # --------------------------------------------------------------------------
@@ -746,3 +1012,92 @@ def wait_until(predicate: Callable[[], bool], timeout_s: float = 2.0, interval_s
             return True
         time.sleep(interval_s)
     return predicate()
+
+
+# --------------------------------------------------------------------------
+# platform helpers for the Windows port (2026-10-21, W-9)
+# --------------------------------------------------------------------------
+#
+# Windows has no POSIX mode bits, and a directory cannot be made unwritable
+# there (chmod on a directory does not block writes). A symlink needs a
+# privilege (developer mode or an administrator). Tests that assert those
+# behaviours skip with a stated reason; tests that assert a DIFFERENT shape
+# per platform assert that shape instead.
+
+
+def requires_posix(reason: str) -> None:
+    """Skip a test that needs POSIX-only filesystem semantics."""
+    if os.name == "nt":
+        raise unittest.SkipTest(reason)
+
+
+def requires_posix_sh(reason: str) -> None:
+    """Skip a test that needs a POSIX shell to run a ``/bin/sh`` script.
+
+    Windows cannot execute a ``/bin/sh`` script, and the Claude hook shim is
+    one: it is a shell script with the CLI path baked in, and the port keeps
+    it exactly as upstream wrote it (the unix path is unchanged). A machine
+    without ``sh`` on PATH cannot run it either - so the check is for the
+    shell, not for the platform, and the unix run still exercises the tests
+    (2026-10-21 port fix, W-22).
+    """
+    if shutil.which("sh") is None:
+        raise unittest.SkipTest(reason)
+
+
+def platform_path(*parts: str) -> Path:
+    """A path in this platform's own shape, for a test that asserts on a path.
+
+    A test that writes ``/opt/x y/bin/herdr-synapse`` and expects it back
+    verbatim asserts a POSIX shape: on Windows that path is drive-relative and
+    comes back as ``\\opt\\x y\\bin\\herdr-synapse``. The path is built from
+    this platform's own separator, so the assertion is about the product's
+    behaviour and not about the shape of the platform (2026-10-21 port fix,
+    W-22).
+    """
+    root = Path(tempfile.gettempdir()).anchor if os.name == "nt" else "/"
+    return Path(root).joinpath(*parts)
+
+
+def symlink_or_skip(source, target) -> None:
+    """Create a symlink, or skip when the machine refuses to (Windows needs
+    a privilege for it)."""
+    try:
+        os.symlink(source, target)
+    except (OSError, NotImplementedError) as err:
+        raise unittest.SkipTest("this machine cannot create symlinks: {}".format(err))
+
+
+def symlink_privilege() -> tuple:
+    """(available, reason) - can this machine create a symlink at all?
+
+    Windows needs a privilege (developer mode or an administrator) for it, so
+    the suite is green only where the privilege exists. The harness REPORTS
+    the answer (tests/conftest.py puts it in the pytest header), so a skip is
+    distinguishable from a real pass instead of a silent one.
+    """
+    probe = Path(tempfile.mkdtemp(prefix="ht-symlink-"))
+    try:
+        target = probe / "target"
+        target.write_text("x", encoding="utf-8")
+        try:
+            os.symlink(target, probe / "link")
+        except (OSError, NotImplementedError) as err:
+            return False, "{}: {}".format(type(err).__name__, err)
+        return True, "symlink creation is available"
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
+
+
+def assert_mode(path, expected: int) -> None:
+    """Assert a POSIX mode bit - only meaningful on POSIX.
+
+    Windows has no POSIX mode bits (chmod only toggles the read-only flag),
+    so the mode is asserted on unix alone and the Windows behaviour is
+    stated rather than skipped.
+    """
+    if os.name == "nt":
+        return
+    actual = stat.S_IMODE(Path(path).stat().st_mode)
+    if actual != expected:
+        raise AssertionError("{}: mode is {:o}, expected {:o}".format(path, actual, expected))

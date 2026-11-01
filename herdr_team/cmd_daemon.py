@@ -66,6 +66,10 @@ def _daemon_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-version", action="store_true", help="start: run against a Herdr version outside the supported 0.8.x/0.9.x lines")
     parser.add_argument("--dry-nudge", action="store_true", help="start: log nudges instead of typing them (HERDR_TEAM_DRY_NUDGE=1)")
     parser.add_argument("--timeout", type=float, default=10.0, help="stop: seconds to wait for the daemon to exit")
+    # Windows has no fork: the parent spawns a detached child that runs the
+    # daemon in-process and reports through a status file.
+    parser.add_argument("--detach-child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--status-file", default=None, help=argparse.SUPPRESS)
 
 
 def _human_start(payload: Dict[str, Any]) -> str:
@@ -120,7 +124,34 @@ def _after_start(args: argparse.Namespace, layout: paths.Layout, payload: Dict[s
         payload["console"] = {"error": "{}: {}".format(type(err).__name__, err)}
 
 
+def _run_detached_child(args: argparse.Namespace) -> int:
+    """The Windows detached child: run the daemon in this process.
+
+    On unix the daemon is a double fork; Windows has no ``fork``, so the
+    parent spawns this process instead (detached, own process group) and
+    polls the status file it writes.
+    """
+    layout = layout_for(args)
+    dmod = _daemon_mod()
+    status_path = None
+    if getattr(args, "status_file", None):
+        from pathlib import Path
+
+        status_path = Path(args.status_file)
+    dmod.run_detached_child(
+        layout,
+        dict(args.env),
+        bool(getattr(args, "replace", False)),
+        status_path,
+        bool(getattr(args, "allow_version", False)),
+        bool(getattr(args, "dry_nudge", False)),
+    )
+    return 0
+
+
 def run_daemon_start(args: argparse.Namespace) -> int:
+    if getattr(args, "detach_child", False):
+        return _run_detached_child(args)
     layout = layout_for(args)
     session = layout.session
     payload: Dict[str, Any] = {

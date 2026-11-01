@@ -14,12 +14,11 @@ from __future__ import annotations
 
 import argparse
 import html
-import json
 from pathlib import Path
 import re
 import shlex
 import sys
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from herdr_team import PLUGIN_ID
 from herdr_team import cmd_misc, tui_model
@@ -179,23 +178,163 @@ def render_cli_section() -> str:
 
 
 _BLOCK_RE = re.compile(r"(?ms)^\[\[actions\]\]\s*\n(.*?)(?=^\[\[|\Z)")
-_VALUE_RE = re.compile(r"(?m)^([a-z_]+)\s*=\s*(.+)$")
+_VALUE_RE = re.compile(r"(?m)^([a-z_]+)\s*=\s*")
 
 
 def manifest_actions(text: str) -> List[Dict[str, Any]]:
-    """Read the small JSON-compatible values used by each manifest action."""
+    """Read the per-action values from the manifest.
+
+    Upstream kept every action value JSON-compatible on one line and parsed it
+    with ``json.loads``.  The Windows port adds a ``-windows`` twin beside each
+    action whose command is a multi-line TOML array holding a ``'''`` literal
+    decoder body, so the values are parsed here with the small TOML grammar the
+    manifest uses instead (strings, arrays, booleans, integers).  ``tomllib``
+    stays out of it: Python 3.9/3.10 do not have it, and the plugin's floor is
+    3.9.
+    """
     actions: List[Dict[str, Any]] = []
     for match in _BLOCK_RE.finditer(text):
         values: Dict[str, Any] = {}
-        for item in _VALUE_RE.finditer(match.group(1)):
+        source = match.group(1)
+        pos = 0
+        while pos < len(source):
+            item = _VALUE_RE.match(source, pos)
+            if item is None:
+                # Not a ``key =`` line: skip to the next line (blank lines, and
+                # the block already ends before the next ``[[`` header).
+                newline = source.find("\n", pos)
+                pos = len(source) if newline < 0 else newline + 1
+                continue
+            key = item.group(1)
             try:
-                values[item.group(1)] = json.loads(item.group(2))
+                values[key], pos = _parse_manifest_value(source, item.end())
             except ValueError as err:
-                raise RuntimeError("cannot parse action {}: {}".format(item.group(1), err))
+                raise RuntimeError("cannot parse action {}: {}".format(key, err))
+            newline = source.find("\n", pos)
+            trailing = source[pos:newline].strip(" \t\r") if newline >= 0 else source[pos:]
+            if trailing:
+                raise RuntimeError(
+                    "cannot parse action {}: trailing characters after the value".format(key))
+            pos = len(source) if newline < 0 else newline + 1
         if "id" not in values or "title" not in values:
             raise RuntimeError("manifest action lacks id or title")
         actions.append(values)
     return actions
+
+
+_BASIC_ESCAPES = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
+_NUMBER_RE = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)")
+_INT_RE = re.compile(r"[+-]?[0-9]+")
+
+
+def _parse_manifest_value(text: str, pos: int) -> Tuple[Any, int]:
+    """Parse one manifest value at ``pos``; return ``(value, end)``.
+
+    Covers the value grammar ``herdr-plugin.toml`` uses: quoted strings
+    (single- and double-quoted, multi-line literal ``'''`` and basic ``\"\"\"``),
+    arrays, booleans and numbers — everything a JSON-compatible value carries,
+    plus the TOML shapes the port's manifest added.
+    """
+    while pos < len(text) and text[pos] in " \t":
+        pos += 1
+    if pos >= len(text):
+        raise ValueError("expected a value")
+    char = text[pos]
+    if char in "'\"":
+        return _manifest_string(text, pos)
+    if char == "[":
+        return _manifest_array(text, pos)
+    for word, value in (("true", True), ("false", False)):
+        if text.startswith(word, pos):
+            return value, pos + len(word)
+    number = _NUMBER_RE.match(text, pos)
+    if number:
+        raw = number.group(0)
+        return (int(raw) if _INT_RE.fullmatch(raw) else float(raw)), number.end()
+    raise ValueError("unsupported value {!r}".format(text[pos:pos + 12]))
+
+
+def _manifest_array(text: str, pos: int) -> Tuple[List[Any], int]:
+    pos += 1
+    items: List[Any] = []
+    while True:
+        pos = _skip_blank(text, pos)
+        if pos >= len(text):
+            raise ValueError("unterminated array")
+        if text[pos] == "]":
+            return items, pos + 1
+        value, pos = _parse_manifest_value(text, pos)
+        items.append(value)
+        pos = _skip_blank(text, pos)
+        if pos >= len(text):
+            raise ValueError("unterminated array")
+        if text[pos] == ",":
+            pos += 1
+            continue
+        if text[pos] == "]":
+            return items, pos + 1
+        raise ValueError("expected , or ], found {!r}".format(text[pos]))
+
+
+def _manifest_string(text: str, pos: int) -> Tuple[str, int]:
+    triple = text[pos:pos + 3]
+    if triple in ("'''", '"""'):
+        end = text.find(triple, pos + 3)
+        if end < 0:
+            raise ValueError("unterminated multi-line string")
+        body = text[pos + 3:end]
+        if triple == '"""':
+            body = _decode_basic_string(body)
+        return body, end + 3
+    quote = text[pos]
+    end = pos + 1
+    parts: List[str] = []
+    while end < len(text) and text[end] != quote:
+        if text[end] == "\n":
+            raise ValueError("unterminated string")
+        if quote == '"' and text[end] == "\\":
+            part, end = _decode_escape(text, end)
+            parts.append(part)
+        else:
+            parts.append(text[end])
+            end += 1
+    if end >= len(text):
+        raise ValueError("unterminated string")
+    return "".join(parts), end + 1
+
+
+def _decode_basic_string(body: str) -> str:
+    if body.startswith("\n"):
+        body = body[1:]
+    parts: List[str] = []
+    pos = 0
+    while pos < len(body):
+        if body[pos] == "\\":
+            part, pos = _decode_escape(body, pos)
+            parts.append(part)
+        else:
+            parts.append(body[pos])
+            pos += 1
+    return "".join(parts)
+
+
+def _decode_escape(text: str, pos: int) -> Tuple[str, int]:
+    char = text[pos + 1] if pos + 1 < len(text) else ""
+    if char in _BASIC_ESCAPES:
+        return _BASIC_ESCAPES[char], pos + 2
+    if char in "uU":
+        width = 4 if char == "u" else 8
+        digits = text[pos + 2:pos + 2 + width]
+        if len(digits) != width:
+            raise ValueError("truncated \\{} escape".format(char))
+        return chr(int(digits, 16)), pos + 2 + width
+    raise ValueError("unsupported escape \\{}".format(char or ""))
+
+
+def _skip_blank(text: str, pos: int) -> int:
+    while pos < len(text) and text[pos] in " \t\r\n":
+        pos += 1
+    return pos
 
 
 def _shell_join(parts: Sequence[Any]) -> str:
@@ -340,7 +479,13 @@ def main(argv: Sequence[str] = ()) -> int:
             return 1
         return 0
     if args.write:
-        REFERENCE_PATH.write_text(rendered, encoding="utf-8")
+        # The reference is committed with unix line endings (no .gitattributes,
+        # core.autocrlf off), so the write states the newline instead of
+        # taking the platform's: Path.write_text would rewrite every line of
+        # the file with CRLF on Windows and turn one generated section into a
+        # whole-file diff.
+        with REFERENCE_PATH.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(rendered)
         return 0
     sys.stdout.write(rendered)
     return 0

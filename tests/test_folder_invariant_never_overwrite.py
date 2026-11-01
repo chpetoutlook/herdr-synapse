@@ -53,6 +53,7 @@ import random
 import re
 import shlex
 import shutil
+from support import is_root, symlink_or_skip
 import unittest
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -481,7 +482,7 @@ class FourthWorld(T.ThirdWorld):
         inherited = self.root / workdir.INHERITED_DIR_NAME
         empty = not os.path.lexists(os.fspath(inherited)) or (inherited.is_dir() and not inherited.is_symlink()
                                                               and not any(inherited.iterdir()))
-        ways = ["chmod"] if os.getuid() != 0 else []
+        ways = ["chmod"] if not is_root() else []
         if empty:
             ways += ["file", "symlink"]
         if inherited.is_dir() and not inherited.is_symlink() and not self.inherited_ro \
@@ -509,7 +510,7 @@ class FourthWorld(T.ThirdWorld):
             elsewhere = self.tmp / "elsewhere-{}".format(self.token())
             elsewhere.mkdir()
             self.outside_roots.append(elsewhere)
-            os.symlink(os.fspath(elsewhere), os.fspath(inherited))
+            symlink_or_skip(os.fspath(elsewhere), os.fspath(inherited))
 
             def undo() -> None:
                 inherited.unlink()

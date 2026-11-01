@@ -241,7 +241,13 @@ class AnUpgradedFolderIsThisTeamsOwn(unittest.TestCase):
         for path in [rig.files["knowledge"]] + sorted(rig.files["members"].glob("*.md")):
             text = path.read_text(encoding="utf-8")
             first, rest = text.split("\n", 1)
-            path.write_text(workdir.MARKER + "\n" + rest, encoding="utf-8")
+            # The bytes are written BYTE-level: a text-mode write on Windows
+            # translates every newline into two bytes, so the file would carry
+            # CRLF while the older plugin - and the current one - wrote bytes
+            # with LF, and the upgrade grace would then correctly refuse to
+            # recognise the team's own file.  The product is right; the FIXTURE
+            # has to write what it means to write (measured 2026-10-22, W-39).
+            path.write_bytes((workdir.MARKER + "\n" + rest).encode("utf-8"))
         mirror = {name: workdir.digest((rig.files["members"] / name).read_text(encoding="utf-8"))
                   for name in sorted(os.listdir(rig.files["members"]))}
         store.write_json(rig.paths.mirror_json, mirror)

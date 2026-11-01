@@ -243,7 +243,7 @@ class Sketch:
     def send(self, cli: str = "herdr-synapse", timeout: float = 60.0) -> Dict[str, Any]:
         """Run ``<cli> canvas draw --file - --json`` with this batch; its parsed result (or its error object)."""
         done = subprocess.run([cli, "canvas", "draw", "--file", "-", "--json"], input=self.to_json(), capture_output=True,
-                              text=True, timeout=timeout, check=False)
+                              text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
         for stream in (done.stdout, done.stderr):
             for line in stream.splitlines():
                 line = line.strip()

@@ -89,6 +89,31 @@ class MainTests(unittest.TestCase):
         code, out, _ = run_cli(["--skill", "--json"])
         self.assertEqual(json.loads(out)["skill_version"], SKILL_VERSION)
 
+    def test_a_transport_failure_is_a_json_error_not_a_traceback(self):
+        """A raw OSError from the transport used to escape as a Python
+        traceback (the reviewer hit it on ``herdr-synapse board --new``).
+        The CLI names the condition instead (2026-10-21 port fix, W-15)."""
+
+        class _Broken:
+            def request(self, *args, **kwargs):
+                raise OSError(5, "write to the Herdr pipe failed: The handle is invalid")
+
+            def request_raw(self, *args, **kwargs):
+                raise OSError(5, "write to the Herdr pipe failed: The handle is invalid")
+
+            def ping(self, *args, **kwargs):
+                raise OSError(5, "write to the Herdr pipe failed: The handle is invalid")
+
+        out, err = io.StringIO(), io.StringIO()
+        with TempState() as ts:
+            code = cli.main(["me", "--json"], env=ts.env, stdout=out, stderr=err, api=_Broken())
+        text = err.getvalue()
+        self.assertNotIn("Traceback", text)
+        self.assertTrue(text.strip(), "the failure must be reported")
+        payload = json.loads(text.strip().splitlines()[-1])
+        self.assertIn(payload["code"], ("pipe_handle_invalid", "herdr_unreachable"))
+        self.assertEqual(code, 3)
+
     def test_unknown_command_exit_2(self):
         code, out, err = run_cli(["definitely-not-a-command"])
         self.assertEqual(code, 2)

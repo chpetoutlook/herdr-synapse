@@ -62,7 +62,17 @@ def _open(args: argparse.Namespace) -> Tuple[Any, Any, Any, Optional[str]]:
 
 
 def _require_operator(layout: Any, author: Any, action: str, team: Optional[str]) -> None:
+    """Watch is the operator's, and a delegate's for its own team.
+
+    A delegate holds the operator's authority for its team, so it may watch
+    that team's members: watching is how the lead sees what its seats are
+    doing, and a lead that cannot watch still needs the operator.
+    """
+    from herdr_team import identity as _identity
+
     if author.trusted_human:
+        return
+    if _identity.is_operator_delegate(author, getattr(author, "team", None)):
         return
     audit(layout, author.team or team, "author_mismatch", author, {"action": action})
     if author.is_human:

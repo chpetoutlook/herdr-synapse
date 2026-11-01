@@ -1957,6 +1957,7 @@ just written it; a schedule that fails toasts you and wakes nobody.
 
 ## Documentation
 
+- [SUPERUSER.md](SUPERUSER.md): Superuser agent — operator authority from a harness pane via process ancestry sweep.
 - [docs/reference.md](docs/reference.md): every CLI command and parameter, plugin action, console command, and GUI shortcut in one place.
 - [docs/use-cases.md](docs/use-cases.md): ready-to-adapt development, vulnerability-hunting, research, review-swarm, and linked-team recipes using mixed agent types.
 - [docs/human-testing.md](docs/human-testing.md): a guided first run, including an isolated sandbox session that cannot interfere with your real Herdr.

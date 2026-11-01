@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import FAKE_AGENTS, TempState, whiteboard_on
+from support import FAKE_AGENTS, symlink_or_skip, TempState, whiteboard_on
 from test_cmd_roster import env_no_daemon, json_out, live_api, run_cli
 
 from herdr_team import canvas as C
@@ -929,7 +929,7 @@ class Files(CanvasRig):
                 C.asset_path(self.team, name)
         target = C.asset_path(self.team, first["asset"])
         os.unlink(target)
-        os.symlink(self.team.team_json, target)
+        symlink_or_skip(self.team.team_json, target)
         with self.assertRaises(HerdrTeamError):
             C.asset_path(self.team, first["asset"])
 
@@ -961,7 +961,7 @@ class Files(CanvasRig):
         (art / "sub").mkdir()
         (art / "sub" / "d.json").write_text("{}")
         self.assertEqual(C.artifact_file(self.layout, self.team, "sub/d.json"), Path(os.path.realpath(art / "sub" / "d.json")))
-        os.symlink("/etc/hosts", art / "link.csv")
+        symlink_or_skip("/etc/hosts", art / "link.csv")
         for rel in ("/etc/hosts", "../x.csv", "link.csv", "missing.csv", ""):
             with self.assertRaises(HerdrTeamError) as ctx:
                 C.artifact_file(self.layout, self.team, rel)

@@ -22,7 +22,7 @@ from typing import Any, Dict, List
 from herdr_team import activity as A
 from herdr_team import roster, store, transcripts
 from herdr_team.errors import HerdrTeamError
-from support import FAKE_MEMBERS, FakeApi, TempState, fake_agent
+from support import assert_mode, fake_agent, FAKE_MEMBERS, FakeApi, TempState
 
 CLAUDE_ID = "11111111-aaaa-4bbb-8ccc-000000000001"
 CODEX_ID = "01a0b063-aca2-7ac0-9559-d64f736d3e5c"
@@ -802,7 +802,7 @@ class WatchFileTests(unittest.TestCase):
         self.assertTrue(entry["at"])
         doc = store.read_json(A.watch_path(self.session))
         self.assertEqual(doc["v"], 1)
-        self.assertEqual(oct(os.stat(A.watch_path(self.session)).st_mode & 0o777), "0o600")
+        assert_mode(A.watch_path(self.session), int("0o600", 8))
         again = A.add_watch(self.session, {"terminal_id": "term_a", "pane_id": "w9:p1", "team": "alpha"}, "someone-else")
         self.assertEqual((again["pane_id"], again["team"], again["name"], again["by"], again["at"]), ("w9:p1", "alpha", "a", "human", entry["at"]))
         self.assertTrue(A.is_watched(self.session, "term_a"))

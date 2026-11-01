@@ -6,7 +6,7 @@ import unittest
 
 from herdr_team import ledger as L
 from herdr_team import store
-from support import TempState
+from support import TempState, assert_mode
 
 
 def attempt(attempt_id, member="alpha-reviewer", kind="codex", seqs=(41, 42), attempts=1, **extra):
@@ -41,7 +41,9 @@ class LedgerWriteTests(unittest.TestCase):
         self.assertEqual(lines[2]["cursor_latency_ms"], 15000.0)
         for line in lines:
             self.assertRegex(line["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
-        self.assertEqual(oct(os.stat(self.ts.team.ledger).st_mode & 0o777), oct(0o600))
+        # Windows has no POSIX mode bits (chmod only toggles the read-only
+        # flag), so the mode is asserted on unix alone (support.assert_mode).
+        assert_mode(self.ts.team.ledger, 0o600)
 
     def test_attempts_merge_phases_and_open_intents_count_as_sent(self):
         self.ledger.record_intent(attempt("a1"))

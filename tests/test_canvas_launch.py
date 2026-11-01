@@ -18,7 +18,7 @@ from support import TempState, fake_agent, whiteboard_on
 from test_cmd_roster import env_no_daemon, json_out, live_api, run_cli
 import test_models as rigs
 
-from herdr_team import cmd_models, cmd_restore, cmd_roster, features, models, roster, store, swap
+from herdr_team import cmd_models, cmd_restore, cmd_roster, features, models, paths, roster, store, swap
 
 MCP_KINDS = ("claude", "codex")
 #: Spawned by the four-path tests but given no MCP flag: Pi has no --mcp-config and exits on an unknown flag.
@@ -69,7 +69,13 @@ class LaunchArgsTests(unittest.TestCase):
 
     def test_the_spec_names_this_checkout_the_socket_and_the_team_dir(self):
         self.assertEqual(self.spec["server"], "synapse_canvas")
-        self.assertTrue(self.spec["command"].endswith(os.path.join("bin", "herdr-synapse")))
+        # The launcher is the one THIS platform can execute: the port ships
+        # bin/herdr-synapse.cmd on Windows and the POSIX sh script on unix, and
+        # a spec naming the other one is a dead end.  So the test asks the
+        # PRODUCT for the path instead of hardcoding one platform's name
+        # (2026-10-22 port fix, W-43).
+        self.assertTrue(self.spec["command"].endswith(
+            os.fspath(paths.cli_launcher_path())))
         self.assertEqual(self.spec["args"][-2:], ["canvas", "mcp"])
         self.assertEqual(self.spec["args"][self.spec["args"].index("--team") + 1], os.path.abspath(os.fspath(self.ts.team.root)))
         doc = store.read_json(features.mcp_config_path(self.ts.team))

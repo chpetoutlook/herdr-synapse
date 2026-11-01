@@ -13,6 +13,7 @@ from herdr_team import canvas_charts as CC
 from herdr_team.canvas_charts import _data
 from herdr_team.canvas_charts import _format as F
 from herdr_team.errors import HerdrTeamError
+from support import symlink_or_skip
 
 
 def refusal(fn, *args, **kw):
@@ -196,8 +197,12 @@ class Fetching(CanvasRig):
         io = C._FetchIO(self.layout, self.team, None)
         self.assertEqual(refusal(io.read_artifact, "x.csv", (".csv",), 100).code, "artifacts_unset")
         art = self.artifacts()
-        (art / "a.csv").write_text("a\n1\n")
-        (art / "big.csv").write_text("a\n" + "1\n" * 200)
+        # the artifact is written as BYTES: a text-mode write turns every \n
+        # into \r\n on Windows, so the reader would hand back a different byte
+        # string than the one the assertion below compares against
+        # (2026-10-21 port fix, W-22)
+        (art / "a.csv").write_bytes(b"a\n1\n")
+        (art / "big.csv").write_bytes(b"a\n" + b"1\n" * 200)
         (art / "sub").mkdir()
         (art / "sub" / "m.gltf").write_text("{}")
         (art / "sub" / "m.bin").write_bytes(b"\0" * 8)
@@ -211,7 +216,7 @@ class Fetching(CanvasRig):
             self.assertEqual(refusal(io.read_artifact, bad, (".csv",), 100).code, "path_refused", bad)
         outside = self.ts.tmp / "secret.csv"
         outside.write_text("a\n1\n")
-        os.symlink(outside, art / "link.csv")
+        symlink_or_skip(outside, art / "link.csv")
         self.assertEqual(refusal(io.read_artifact, "link.csv", (".csv",), 100).code, "path_refused", "no symlink escapes")
         model = io.read_artifact("sub/m.gltf", (".gltf",), 100)
         self.assertEqual(io.sibling(model, "m.bin", (".bin",), 100).rel, "sub/m.bin")

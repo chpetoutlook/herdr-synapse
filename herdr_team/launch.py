@@ -17,9 +17,9 @@ from typing import Any, Dict, List, Optional, Sequence
 from herdr_team import api as _api
 from herdr_team.errors import EXIT_REFUSED, HerdrTeamError
 
-AGENT_START_TIMEOUT_MS = 60000
+AGENT_START_TIMEOUT_MS = 300000
 AGENT_START_RETRY_S = 0.5
-AGENT_START_RETRY_WINDOW_S = 10.0
+AGENT_START_RETRY_WINDOW_S = 60.0
 
 
 def agent_start_argv(name: str, kind: str, pane_id: str, timeout_ms: int = AGENT_START_TIMEOUT_MS, args: Sequence[str] = ()) -> List[str]:

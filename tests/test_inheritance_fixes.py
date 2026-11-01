@@ -25,7 +25,7 @@ from herdr_team import charter, roster, store, workdir
 from herdr_team import document_sync as DS
 from herdr_team import facts as F
 from herdr_team.identity import Author
-from support import TempState
+from support import requires_posix, symlink_or_skip, TempState
 from test_cmd_board import pane_api
 from test_cmd_roster import json_out, run_cli
 
@@ -266,7 +266,11 @@ class HoldFindings(unittest.TestCase):
         path = rig.files["members"] / "alpha-worker.md"
         edited = path.read_text(encoding="utf-8").replace("the first mission", "the operator's new mission")
         edited = edited.replace("## Mission", "A note the operator wrote above the heading.\n\n## Mission", 1)
-        path.write_text(edited, encoding="utf-8")
+        # The operator's edit is written as BYTES: a text-mode write turns every
+        # \n into \r\n on Windows, so the file would hold a different byte string
+        # than the one the assertion below compares against (2026-10-21 port fix,
+        # W-22).
+        path.write_bytes(edited.encode("utf-8"))
         DS.scan(rig.layout, rig.name, now=100.0)
         result = DS.scan(rig.layout, rig.name, now=103.0)
         self.assertEqual((result["imported"], result["proposed"]), ([], [os.fspath(path)]), result)
@@ -478,7 +482,7 @@ class SecondFixStageFindings(unittest.TestCase):
         self.addCleanup(shutil.rmtree, outside, True)
         (outside / "main.py").write_text("print('the repository')\n", encoding="utf-8")
         rig.files["root"].mkdir(parents=True, exist_ok=True)
-        os.symlink(os.fspath(outside), os.fspath(rig.files["canvas_assets"]))
+        symlink_or_skip(os.fspath(outside), os.fspath(rig.files["canvas_assets"]))
         guard = DS.FolderGuard(rig.layout, rig.name, rig.files)
         out = workdir.prune_canvas_assets(guard, rig.files["canvas_assets"], [])
         self.assertEqual(out["pruned"], [])
@@ -489,6 +493,9 @@ class SecondFixStageFindings(unittest.TestCase):
 
     def test_a_fifo_at_a_record_never_stalls_the_render(self):
         """``mkfifo knowledge.md`` blocked ``drifted``'s read for good, and with it the notifier's tick."""
+        # A FIFO is a POSIX shape: Windows has no mkfifo, and the alarm this
+        # test arms (SIGALRM) is POSIX-only too (2026-10-21 port fix, W-22).
+        requires_posix("a FIFO needs POSIX: Windows has no mkfifo, and SIGALRM is POSIX-only")
         import signal
 
         rig = Rig(self, mode="auto")

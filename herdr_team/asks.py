@@ -35,32 +35,64 @@ LOOKBACK = 400
 
 
 def is_ask(record: Any) -> bool:
-    """True when ``record`` is a member post addressed to the operator."""
+    """True when ``record`` is a member asking the operator for something.
+
+    Only the kinds that want an answer count: a question, a request, a blocked
+    report. A completion notice, a note or a handoff addressed to the operator
+    is a report, not a request, and it does not belong in the one list that
+    means "somebody has to answer this" -- that list is short, and everything
+    in it is real.
+
+    A member the operator delegated to is the operator's hands inside its
+    team: its post addressed to the operator is not a request the operator
+    has to answer, so it does not enter the ask queue either. The operator
+    still sees it on the board and in its inbox; it just does not sit in the
+    one list that means "a person is needed here".
+    """
     if not isinstance(record, dict):
         return False
     if record.get("from") in (None, "human", "system"):
         return False
-    if record.get("kind") not in ("note", "request", "handoff", "done", "blocked", "question", "answer"):
+    if record.get("kind") not in ("question", "request", "blocked"):
+        return False
+    origin = record.get("origin") if isinstance(record.get("origin"), dict) else {}
+    if origin.get("operator"):
         return False
     return "human" in [t for t in (record.get("to") or []) if isinstance(t, str)]
 
 
-def answered_by(record: Any) -> Optional[int]:
+def answered_by(record: Any, session: Any = None, team: Optional[str] = None) -> Optional[int]:
     """The seq this record answers, when the operator wrote it, else None.
 
     Only the operator closes an ask. A teammate replying to a question is a
     peer note on the same thread; it may be useful, it is not an answer.
+
+    A member the operator delegated to (``herdr-synapse operator grant``)
+    holds the operator's authority for that team, so their answer closes the
+    ask the same way the operator's does. The lead and the manager are the
+    operator's hands: an ask addressed to the operator is closed by whoever
+    holds that authority, and nothing waits on a person who is not in the loop.
     """
-    if not isinstance(record, dict) or record.get("from") != "human":
+    if not isinstance(record, dict):
         return None
-    origin = record.get("origin") if isinstance(record.get("origin"), dict) else {}
-    if not record_human_ok(origin):
-        return None  # renders ``(unverified)`` on the board and counts for nothing there either
+    who = record.get("from")
+    if who == "human":
+        origin = record.get("origin") if isinstance(record.get("origin"), dict) else {}
+        if not record_human_ok(origin):
+            return None  # renders ``(unverified)`` on the board and counts for nothing there either
+    elif session is not None and team and isinstance(who, str):
+        from herdr_team import operator as _operator
+
+        if _operator.active(session, team, who) is None:
+            return None  # a peer answer is a note, not an answer
+    else:
+        return None
     reply_to = record.get("reply_to")
     return reply_to if isinstance(reply_to, int) and not isinstance(reply_to, bool) else None
 
 
-def pending(team: TeamPaths, dismissed: Optional[Iterable[int]] = None, lookback: int = LOOKBACK) -> List[Dict[str, Any]]:
+def pending(team: TeamPaths, dismissed: Optional[Iterable[int]] = None, lookback: int = LOOKBACK,
+            session: Any = None) -> List[Dict[str, Any]]:
     """Asks still waiting on the operator, newest first.
 
     Cheap enough for a daemon tick: one bounded read, no archive.
@@ -69,9 +101,14 @@ def pending(team: TeamPaths, dismissed: Optional[Iterable[int]] = None, lookback
         records = store.BoardStore(team).read(last=max(1, int(lookback)), include_retracted=False)
     except HerdrTeamError:
         return []
+    if session is None:
+        try:
+            session = team.session_paths
+        except Exception:  # noqa: BLE001 - an unusual path shape is not a reason to fail the read
+            session = None
     skip: Set[int] = {int(s) for s in (dismissed or []) if isinstance(s, int) and not isinstance(s, bool)}
     for record in records:
-        seq = answered_by(record)
+        seq = answered_by(record, session=session, team=team.name)
         if seq is not None:
             skip.add(seq)
         retracts = record.get("retracts")

@@ -66,6 +66,15 @@ SETTLED_NEEDS_DECISION = (STATUS_FAILED, STATUS_PARTIAL)
 ACTIVE = (STATUS_IN_PROGRESS, STATUS_BLOCKED, STATUS_CHANGES)
 
 OUTCOMES = ("succeeded", "failed", "partial")
+#: A ruling is not an attempt outcome: it is the operator's decision about a
+#: work item that has no attempt to settle. Its vocabulary is the operator's
+#: own (``ruled_recover_on_origin_main``, ``blocked_tree_collapse``,
+#: ``accepted``), so it is open - but every slug is checked for shape, because
+#: it lands in a status.
+RULING_OUTCOME_RE = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z")
+#: Where a ruling may leave an item. A ruling decides; it never leaves work
+#: half-done in a way the owner has to finish.
+RULING_STATUSES = (STATUS_DONE, STATUS_BLOCKED, STATUS_FAILED, STATUS_PARTIAL, STATUS_CANCELLED)
 VERDICTS = ("approved", "changes")
 BRIEF_FIELDS = ("target", "deliverable", "constraints", "ownership", "acceptance")
 ACCEPTANCE_POLICIES = ("off", "warn", "require")
@@ -89,7 +98,11 @@ OP_REOPEN = "reopen"
 OP_CLOSE = "close"
 OP_CANCEL = "cancel"
 OP_UPDATE = "update"
-OPS = (OP_CREATE, OP_ASSIGN, OP_CLAIM, OP_BLOCK, OP_UNBLOCK, OP_SETTLE, OP_REVIEW, OP_REOPEN, OP_CLOSE, OP_CANCEL, OP_UPDATE)
+#: The operator's ruling on an item that has no attempt (W-50, W-60, W-61).
+#: It is a decision, not a settlement: the operator may rule on work nobody
+#: has started, and the ruling is the outcome.
+OP_RULE = "rule"
+OPS = (OP_CREATE, OP_ASSIGN, OP_CLAIM, OP_BLOCK, OP_UNBLOCK, OP_SETTLE, OP_REVIEW, OP_REOPEN, OP_CLOSE, OP_CANCEL, OP_UPDATE, OP_RULE)
 
 
 def work_jsonl(team: TeamPaths) -> Any:
@@ -157,6 +170,9 @@ class Item:
     attempts: List[Attempt] = field(default_factory=list)
     reviews: List[Dict[str, Any]] = field(default_factory=list)
     history: List[Dict[str, Any]] = field(default_factory=list)
+    #: The operator's rulings on this item, newest last. A ruling is not an
+    #: attempt: it decides an item that has none.
+    rulings: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def attempt(self) -> Optional[Attempt]:
@@ -167,10 +183,13 @@ class Item:
 
     @property
     def summary(self) -> Optional[str]:
-        """The thread brief: the newest settlement summary."""
+        """The thread brief: the newest settlement summary, or the newest ruling."""
         for attempt in reversed(self.attempts):
             if attempt.summary:
                 return attempt.summary
+        for ruling in reversed(self.rulings):
+            if ruling.get("summary"):
+                return str(ruling["summary"])
         return None
 
     def to_json(self) -> Dict[str, Any]:
@@ -182,6 +201,7 @@ class Item:
             "updated_by": self.updated_by, "block_reason": self.block_reason,
             "attempt": current.to_json() if current is not None else None,
             "attempts": [a.to_json() for a in self.attempts], "reviews": list(self.reviews),
+            "rulings": [dict(r) for r in self.rulings],
             "summary": self.summary,
         }
 
@@ -292,6 +312,24 @@ def _apply(items: Dict[str, Item], event: Dict[str, Any]) -> None:
             current.closed = True
         item.status = STATUS_CANCELLED
         entry["reason"] = event.get("reason")
+    elif op == OP_RULE:
+        # The operator's ruling on an item that has no attempt. It decides the
+        # item: the ruling's outcome slug is recorded on the item, and the
+        # status it names is where the item stands from here.
+        outcome = str(event.get("outcome") or "")
+        status = str(event.get("status") or "")
+        summary = str(event.get("summary") or "")
+        item.rulings.append({
+            "at": at, "by": by, "outcome": outcome, "status": status,
+            "summary": summary,
+            "evidence": [str(e) for e in event.get("evidence") or [] if e is not None] if isinstance(event.get("evidence"), list) else [],
+        })
+        if current is not None:
+            current.closed = True
+        if status in RULING_STATUSES:
+            item.status = status
+            item.block_reason = summary if status == STATUS_BLOCKED else None
+        entry.update({"outcome": outcome, "status": status})
     elif op == OP_UPDATE:
         if isinstance(event.get("title"), str) and event["title"]:
             item.title = event["title"]
@@ -471,6 +509,17 @@ def validate(items: Dict[str, Item], event: Dict[str, Any]) -> None:
     elif op == OP_UPDATE:
         if item.status in FINAL:
             raise _refuse("work_final", "{} is {}; reopen it first".format(item.id, item.status), item)
+    elif op == OP_RULE:
+        if item.status in FINAL:
+            raise _refuse("work_final", "{} is {}; reopen it first".format(item.id, item.status), item)
+        outcome = str(event.get("outcome") or "")
+        if not RULING_OUTCOME_RE.match(outcome):
+            raise _refuse("work_bad_outcome", "{}: a ruling outcome is lower-case words (ruled_recover_on_origin_main)".format(outcome or "(empty)"), item)
+        status = str(event.get("status") or "")
+        if status not in RULING_STATUSES:
+            raise _refuse("work_bad_status", "{}: a ruling leaves the item {}".format(status or "(none)", ", ".join(RULING_STATUSES)), item)
+        if not str(event.get("summary") or "").strip():
+            raise _refuse("work_no_summary", "{}: a ruling says what it decides".format(item.id), item)
 
 
 def next_id(items: Dict[str, Item]) -> str:
@@ -591,8 +640,8 @@ def hints(item: Item, items: Dict[str, Item], members: Dict[str, Dict[str, Any]]
         reviewer = item.review_by[0] if item.review_by else decider
         out.append(_hint("awaiting_review", "reviewer", [cli, "work", "review", item.id, "--approve"], "settled; waiting for {}".format(", ".join(item.review_by) or decider), reviewer))
     elif item.status in SETTLED_NEEDS_DECISION:
-        out.append(_hint("settled_needs_decision", decider_role, [cli, "work", "reopen", item.id],
-                         "ended {}; reopen it, or accept it with: herdr-synapse work close {}".format(item.status, item.id), decider))
+        out.append(_hint("settled_needs_decision", decider_role, [cli, "work", "reopen", item.id, "the defect that reopens it"],
+                         "ended {}; reopen it with its reason, or accept it with: herdr-synapse work close {} \"why\"".format(item.status, item.id), decider))
     return out
 
 

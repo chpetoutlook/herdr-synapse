@@ -1388,7 +1388,13 @@ def file_index(root: str, now: Optional[float] = None, limit: int = FILE_INDEX_L
         for dirpath, dirnames, filenames in os.walk(base):
             dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in FILE_INDEX_SKIP_DIRS)
             rel_dir = os.path.relpath(dirpath, base)
-            prefix = "" if rel_dir == "." else rel_dir + "/"
+            # The index's paths are POSIX: a directory ends in "/" and a file's
+            # separator is the same, so the key is one shape. ``os.path.relpath``
+            # renders with the PLATFORM separator, so on Windows it would be
+            # "src\\deep" and the key would come out MIXED - "src\\deep/matrix.rs",
+            # a shape no consumer can rely on (measured 2026-10-22, W-33).
+            # ``as_posix`` renders the whole relative path with "/".
+            prefix = "" if rel_dir == "." else Path(rel_dir).as_posix() + "/"
             for name in dirnames:
                 entries.append((prefix + name + "/", True))
             for name in sorted(filenames):
@@ -1482,7 +1488,20 @@ def _insert_path(root: str, rel: str, here: str, primary: bool = True) -> str:
             return rel
     except OSError:
         pass
-    return os.path.join(root, rel)
+    # The root is a NATIVE path, so the relative part has to be native too:
+    # joining a native root with a POSIX relative path produces a MIXED path
+    # ("C:\\...\\other\\lib/matrix.py"), which is neither shape a consumer
+    # can rely on.  The index's own keys stay POSIX (file_index renders them
+    # with as_posix), so they are converted HERE, at the point where they
+    # become a filesystem path (measured 2026-10-22, W-33).
+    #
+    # A DIRECTORY keeps its trailing "/" - that is the product's own marker
+    # for "this is a directory" (file_index appends it), and the consumer
+    # that inserts the path expects it, so it stays the POSIX slash even
+    # when the rest of the path is native.
+    if rel.endswith("/"):
+        return os.path.join(root, rel[:-1].replace("/", os.sep)) + "/"
+    return os.path.join(root, rel.replace("/", os.sep))
 
 
 def path_candidates(prefix: str, base_dir: Optional[str] = None) -> List[Dict[str, str]]:

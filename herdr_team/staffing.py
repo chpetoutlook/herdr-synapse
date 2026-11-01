@@ -25,13 +25,37 @@ def policy(config: Any) -> Optional[Dict[str, Any]]:
 
 
 def operator(author: Any) -> None:
-    if not author.trusted_human:
-        raise HerdrTeamError("author_mismatch", "staffing policy is the operator's alone; delegation does not pass this authority", EXIT_REFUSED)
+    """The staffing policy is the operator's, or a delegate's, for their own team.
+
+    A delegate the operator granted holds the operator's authority for that
+    team: a team that cannot approve its own worker pool still needs the
+    operator, and the operator is not in the team's loop.
+    """
+    from herdr_team import identity as I
+
+    if author.trusted_human:
+        return
+    if I.is_operator_delegate(author, getattr(author, "team", None)):
+        return
+    raise HerdrTeamError("author_mismatch", "staffing policy is the operator's alone; delegation does not pass this authority", EXIT_REFUSED)
 
 
 def require_manager(team: roster.Team, author: Any) -> None:
+    """The current verified manager of this team, or a delegate of it.
+
+    A delegate holds the operator's authority for the team, so it may act as
+    its manager: the team keeps staffing itself without the operator. The
+    delegate must still be a current member of this roster: a grant names a
+    seat, and a seat that was replaced is not that seat.
+    """
+    from herdr_team import identity as I
+
     if author.trusted_human:
         return
+    if I.is_operator_delegate(author, getattr(author, "team", None)):
+        row = team.find(getattr(author, "name", "") or "")
+        if row is not None and row.status not in ("left", "missing"):
+            return
     manager = team.manager()
     if (manager is None or not author.verified or author.team != team.team or author.name != manager.name
             or author.terminal_id != manager.terminal_id or author.generation != manager.generation

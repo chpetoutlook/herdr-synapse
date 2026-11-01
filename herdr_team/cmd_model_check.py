@@ -25,7 +25,10 @@ def _run(args: argparse.Namespace) -> int:
     hint = paths.team_name_from_arg(getattr(args, "team", None), args.env)
     author = resolve_author(args, layout, api_for(args, layout), team=hint, require_server=False)
     if not author.trusted_human:
-        raise HerdrTeamError("author_mismatch", "model-check is the operator's alone", EXIT_REFUSED)
+        from herdr_team import identity as _identity
+
+        if not _identity.is_operator_delegate(author, getattr(author, "team", None)):
+            raise HerdrTeamError("author_mismatch", "model-check is the operator's alone", EXIT_REFUSED)
     if not args.yes:
         raise HerdrTeamError("confirmation_required", "one request may consume quota or incur charges; confirm with --yes", EXIT_REFUSED)
     cwd = os.path.abspath(os.path.expanduser(args.cwd))

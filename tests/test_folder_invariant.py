@@ -131,7 +131,7 @@ from herdr_team import charter, cli, roster, store, workdir
 from herdr_team import document_sync as DS
 from herdr_team import facts as F
 from herdr_team.identity import Author
-from support import FakeApi, TempState, whiteboard_on
+from support import FakeApi, is_root, symlink_or_skip, TempState, whiteboard_on
 
 DEFAULT_SEEDS = 40
 DEFAULT_STEPS = 30
@@ -1419,7 +1419,7 @@ class World(object):
                         "inherited_missing", "inherited_file", "fresh_clone", "recreate", "inherited_ro")
         if self.folder_ro and name in world_writes:
             return False  # a read-only checkout receives no pull
-        if name in ("folder_ro", "inherited_ro", "disk_full") and os.getuid() == 0:
+        if name in ("folder_ro", "inherited_ro", "disk_full") and is_root():
             return False
         if name == "folder_ro" and self.folder_ro:
             return False
@@ -2427,7 +2427,7 @@ class ExtendedWorld(World):
                     self.place_outside(base / entry.name, entry.read_bytes())
             _rmtree(assets)
         assets.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(os.fspath(base), os.fspath(assets))
+        symlink_or_skip(os.fspath(base), os.fspath(assets))
         for entry in sorted(base.iterdir()):
             if entry.is_file():
                 self.model.world_placed("canvas-assets/" + entry.name, entry.read_bytes(), "reached through the symlink")
@@ -2443,7 +2443,7 @@ class ExtendedWorld(World):
         self.world_remove(workdir.INHERITED_DIR_NAME)
         inherited = self.root / workdir.INHERITED_DIR_NAME
         inherited.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(os.fspath(base), os.fspath(inherited))
+        symlink_or_skip(os.fspath(base), os.fspath(inherited))
         self.trace[-1] = "inherited/ becomes a symlink to a directory outside the repository"
 
     def symlink_record(self, rel: str) -> None:
@@ -2454,7 +2454,7 @@ class ExtendedWorld(World):
         if os.path.lexists(os.fspath(path)):
             self.world_remove(rel)
         path.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(os.fspath(target), os.fspath(path))
+        symlink_or_skip(os.fspath(target), os.fspath(path))
         self.trace[-1] = "{} becomes a symlink to a file in the repository outside the team folder".format(rel)
 
     def ev_unsymlink(self) -> None:
@@ -3318,7 +3318,7 @@ class ThirdWorld(ExtendedWorld):
             (["peer"] if self.peer is not None else [])
         kind = self.rng.choice(kinds)
         step = self.rng.choice(self.HAZARD_STEPS)
-        if kind.startswith("disk-full") and os.getuid() == 0:
+        if kind.startswith("disk-full") and is_root():
             kind = "race-document"
         self._armed = PeerRenders if kind == "peer" else _HAZARDS[kind]
         self.trace[-1] = "{} during {}".format(kind, step)

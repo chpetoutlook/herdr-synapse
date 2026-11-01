@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from herdr_team import sanitize, store
+from herdr_team import paths as _paths
 from herdr_team import usage
 from herdr_team import usage as _usage
 from herdr_team.cli import Command, api_for, emit, layout_for
@@ -219,8 +220,9 @@ def _run_pane(args: argparse.Namespace) -> int:
 
     env = dict(args.env)
     layout = layout_for(args)
-    if env.get("HERDR_PLUGIN_ENTRYPOINT_ID") != ENTRYPOINT and not getattr(args, "force", False):
+    if not _paths.entrypoint_matches(env, ENTRYPOINT) and not getattr(args, "force", False):
         raise HerdrTeamError("not_a_plugin_pane", "usage-pane runs in the usage popup; use `herdr-synapse ui usage`, `herdr-synapse usage`, or pass --force", EXIT_REFUSED)
+    _paths.require_vendor_curses(env)
     if not _paths.socket_allowed(layout.config_dir, layout.socket):
         sys.stderr.write("herdr-synapse usage-pane skipped: socket not allowed\n")
         return EXIT_OK

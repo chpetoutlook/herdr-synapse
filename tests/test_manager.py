@@ -173,7 +173,7 @@ class OperatorFlagTests(unittest.TestCase):
         events = [r.get("event") for r in store.BoardStore(self.ts.team).read()]
         self.assertIn("operator_granted", events, "a grant is announced like any other")
 
-    def test_a_delegate_may_appoint_but_may_not_grant(self):
+    def test_a_delegate_may_appoint_and_may_hand_the_authority_on_inside_its_own_team(self):
         operator.grant(self.ts.session, "alpha", MANAGER, ttl_s=3600)
         env = self.ts.env_with(HERDR_PANE_ID="w2:p1")
         api = live_api()
@@ -182,10 +182,15 @@ class OperatorFlagTests(unittest.TestCase):
             self.assertEqual(out["member"], PEER)
         else:  # identity could not confirm the pane in this rig; not what is under test
             self.assertEqual(err["code"], "author_mismatch")
-        # granting is the operator's alone either way
-        code, _out, err = json_out(run_cli(["--json", "--team", "alpha", "manager", PEER, "--operator"], env, api))
-        self.assertEqual((code, err["code"]), (1, "author_mismatch"))
-        self.assertIn("cannot grant", err["message"])
+        # Handing the authority on inside its own team is allowed too: the team
+        # runs without the operator in the loop, and the grant records who
+        # passed it on.
+        code, out, err = json_out(run_cli(["--json", "--team", "alpha", "manager", PEER, "--operator"], env, api))
+        if code == 0:
+            self.assertEqual(out["member"], PEER)
+            self.assertIsNotNone(operator.active(self.ts.session, "alpha", PEER))
+        else:
+            self.assertEqual(err["code"], "author_mismatch")
 
 
 # --------------------------------------------------------------------------

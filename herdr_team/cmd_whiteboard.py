@@ -388,7 +388,7 @@ def _open_popup(args: argparse.Namespace, layout: Any, api: Any, env: Dict[str, 
     """The plugin action runs as the plugin, which cannot vouch for a person; the popup's process can."""
     if not _paths.socket_allowed(layout.config_dir, layout.socket):
         return emit(args, {"opened": False, "skipped": "socket_not_allowed"}, "whiteboard open skipped: socket not allowed")
-    params: Dict[str, Any] = {"plugin_id": PLUGIN_ID, "entrypoint": POPUP_ENTRYPOINT, "focus": True}
+    params: Dict[str, Any] = {"plugin_id": PLUGIN_ID, "entrypoint": _paths.entrypoint_id(POPUP_ENTRYPOINT), "focus": True}
     team = env.get("HERDR_TEAM")
     if team:
         params["env"] = {"HERDR_TEAM": team}

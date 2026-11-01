@@ -5,7 +5,7 @@ import os
 import unittest
 from unittest import mock
 
-from support import FAKE_AGENTS, TempState, whiteboard_on
+from support import assert_mode, FAKE_AGENTS, symlink_or_skip, TempState, whiteboard_on
 from test_cmd_roster import env_no_daemon, json_out, live_api, run_cli
 
 from herdr_team import canvas as C
@@ -110,7 +110,7 @@ class Recall(Rig):
         self.assertEqual(len(self.recall("rebuildable")), 1)
         R.index_path(self.ts.team).unlink()
         self.assertEqual(len(self.recall("rebuildable")), 1)
-        self.assertEqual(os.stat(R.index_path(self.ts.team)).st_mode & 0o777, 0o600)
+        assert_mode(R.index_path(self.ts.team), 0o600)
 
 
 class Canvas(Rig):
@@ -250,7 +250,7 @@ class ReviewFindings(Rig):
         outside.mkdir()
         (outside / "secret-plans.md").write_text("quarterly acquisition target\n", encoding="utf-8")
         shutil.rmtree(self.artifacts)
-        os.symlink(outside, self.artifacts)
+        symlink_or_skip(outside, self.artifacts)
         self.assertEqual(self.recall("acquisition", "--kind", "file"), [])
 
 

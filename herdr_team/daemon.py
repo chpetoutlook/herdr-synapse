@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from herdr_team import PLUGIN_ID, VERSION, capabilities, gate, nudge, render, roster, sanitize, store
+from herdr_team import PLUGIN_ID, VERSION, capabilities, gate, nudge, paths, render, roster, sanitize, store
 from herdr_team import charter as _charter
 from herdr_team import identity as _identity
 from herdr_team import launch as _launch
@@ -57,6 +57,7 @@ from herdr_team import links as _links
 from herdr_team import permissions as _permissions
 from herdr_team import models as _models
 from herdr_team import context as _context
+from herdr_team import platform_compat as _compat
 from herdr_team import remote as _remote
 from herdr_team import operator as _operator
 from herdr_team import usage as _usage
@@ -83,7 +84,31 @@ HEARTBEAT_S = 30.0
 TASK_TTL_MS = 120000
 POLL_IDLE_S = 2.0
 POLL_PENDING_S = 0.5
-TAIL_TICK_S = 0.25
+TAIL_TICK_S = 1.0
+#: How often the daemon wakes the members whose work is stuck (one tick is one second).
+MANAGER_NUDGE_INTERVAL_TICKS = 60
+#: How often the daemon wakes the manager to judge and assign. A judgement call is not a
+#: per-minute event, and a manager pinged every minute learns to ignore the ping.
+MANAGER_ASSIGN_INTERVAL_TICKS = 180
+#: How often the daemon sends the team's lead the pending list: every item that
+#: cannot move on its own (unclaimed, waiting for a review, blocked, waiting on
+#: a dead dependency), each with the command that moves it. The lead resolves
+#: and owns the solution path; the daemon only reports and wakes.
+LEADER_PENDING_INTERVAL_TICKS = 180
+#: How often the manager sweeps the team: idle seats, unowned work, verdicts and
+#: open asks. A sweep is a look at the whole board, not a per-minute event.
+MANAGER_SWEEP_INTERVAL_TICKS = 300
+#: How often the seats that are sitting idle are told to drive their own work.
+IDLE_AGENT_INTERVAL_TICKS = 300
+#: How long an idle seat's request to the manager counts as "already asked".
+#: Long enough that the manager has had a real chance to answer, short enough
+#: that a seat whose request was ignored gets asked again.
+IDLE_ASKED_WINDOW_S = 7200.0
+#: How long a reported queue stays un-reported before the target is woken again. The nudge
+#: ladder gives up after ``RENUDGE_AFTER_S`` (about 17 minutes); this is the daemon's own
+#: backstop, and it fires inside that window so a target that read its nudge and did
+#: nothing still gets asked again.
+MANAGER_NUDGE_REWAKE_S = 900.0
 RECONNECT_BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 RECONNECT_GIVE_UP_S = 60.0
 #: ``plugin.list`` poll interval. PK-08 needs a disabled plugin to clear its tokens and view and
@@ -202,6 +227,11 @@ SYSTEM_EVENT_DELIVERY: Dict[str, Dict[str, Any]] = {
     "link_read": {},  # a receipt for the sending console; nobody is woken
     "board_cleared": {},  # visible on the board and in hook context; nobody is woken
     "work_ready": {"wake": "named"},  # a dependency settled: the owner can start
+    "work_review": {"wake": "named"},  # a settled item is waiting for a named reviewer
+    "manager_nudge": {"wake": "named"},  # the manager's queue needs judgement: only the manager can assign
+    "leader_pending": {"wake": "named"},  # the lead's pending list: items that cannot move on their own
+    "manager_sweep": {"wake": "named"},  # the manager's look at the whole team
+    "idle_agent": {"wake": "named"},  # a seat sitting idle while its work waits on someone else
     "work_cancelled": {},
     "fact_added": {},  # peer notes: awareness, never a wake
     "fact_retired": {},
@@ -467,34 +497,23 @@ class DaemonInfo:
 
 
 def process_start_time(pid: int) -> Optional[str]:
-    """``ps -o lstart= -p <pid>`` trimmed; None when the pid is gone."""
-    try:
-        completed = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", str(int(pid))],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=3.0,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        return None
-    text = completed.stdout.decode("utf-8", "replace").strip()
-    if completed.returncode != 0 or not text:
-        return None
-    return text
+    """The identity token of a live process, or None when it is gone.
+
+    unix: ``ps -o lstart=`` trimmed. Windows: the process creation time as
+    ``YYYY-MM-DDTHH:MM:SSZ`` (UTC, second precision). The Windows event
+    hook computes the same token through ``Get-Process``; see
+    ``herdr_team.platform_compat``.
+    """
+    return _compat.process_start_time(pid)
 
 
 def pid_alive(pid: int) -> bool:
-    try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except (OSError, ValueError):
-        return False
-    return True
+    """True when a process with this pid exists.
+
+    Windows note: ``os.kill(pid, 0)`` would TERMINATE the process there, so
+    the Windows branch asks the kernel for the exit code instead.
+    """
+    return _compat.pid_alive(pid)
 
 
 def read_daemon_info(session: SessionPaths) -> Optional[DaemonInfo]:
@@ -535,12 +554,35 @@ def beat_age_s(session: SessionPaths) -> Optional[float]:
     return max(0.0, time.time() - beat)
 
 
+def stop_file(session: SessionPaths) -> Path:
+    """The Windows stop-request file.
+
+    Windows delivers no ``SIGTERM`` to a detached, console-less process, so
+    the daemon polls this file instead; ``taskkill`` is the hard fallback.
+    """
+    return session.root / "daemon.stop"
+
+
 def stop_daemon(session: SessionPaths, timeout_s: float = 10.0) -> bool:
-    """SIGTERM the pid in ``daemon.json`` only after the start time matches; True when it is gone."""
+    """Stop the pid in ``daemon.json`` only after the start time matches; True when it is gone."""
     info = read_daemon_info(session)
     if not info_alive(info):
         return False
     assert info is not None
+    if _compat.IS_WINDOWS:
+        try:
+            with open(stop_file(session), "w", encoding="utf-8") as handle:
+                handle.write(str(info.pid))
+        except OSError:
+            return False
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while time.monotonic() < deadline:
+            if not pid_alive(info.pid) or process_start_time(info.pid) != info.start_time:
+                return True
+            time.sleep(0.05)
+        # The daemon did not leave on its own; take the process down.
+        _compat.terminate_pid(info.pid, force=True)
+        return not pid_alive(info.pid)
     try:
         os.kill(info.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -561,6 +603,11 @@ def stop_daemon(session: SessionPaths, timeout_s: float = 10.0) -> bool:
 
 def _close_fds_except(keep: Sequence[int]) -> None:
     keep_set = set(int(fd) for fd in keep)
+    if _compat.IS_WINDOWS:
+        # Windows has no fork and no inherited-fd sweep worth doing here:
+        # the detached child is spawned with ``close_fds=True`` and the
+        # standard handles are replaced explicitly.
+        return
     try:
         limit = os.sysconf("SC_OPEN_MAX")
     except (ValueError, OSError, AttributeError):
@@ -619,7 +666,7 @@ def _stdio_description(session: SessionPaths) -> str:
     """Where fds 0-2 point, by device/inode comparison (no ``fcntl`` outside ``store``)."""
     names = []
     try:
-        null_st = os.stat("/dev/null")
+        null_st = os.stat(_compat.DEV_NULL)
     except OSError:
         null_st = None
     try:
@@ -649,6 +696,27 @@ def _write_status(fd: Optional[int], obj: Dict[str, Any]) -> None:
         while data:
             written = os.write(fd, data)
             data = data[written:]
+    except OSError:
+        pass
+
+
+def _write_status_file(path: Optional[Path], obj: Dict[str, Any]) -> None:
+    """Report the daemon's start to a file.
+
+    The unix daemon reports through an inherited pipe fd. Windows has no
+    fork, so the detached child writes the same JSON line to a file the
+    parent polls.
+    """
+    if path is None:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
     except OSError:
         pass
 
@@ -684,19 +752,13 @@ def acquire_daemon_lock(session: SessionPaths, socket_path: Path, replace: bool,
         return None, {"already_running": True, "replaced": False, "holder": holder.to_json() if holder else None}
     if holder is not None and info_alive(holder):
         say("taking over from pid {} (replace={}, identity_differs={})".format(holder.pid, replace, identity_differs))
-        try:
-            os.kill(holder.pid, signal.SIGTERM)
-        except OSError:
-            pass
+        _request_stop(session, holder.pid)
     try:
         lock.acquire(wait_s)
     except LockTimeout:
         if holder is not None and info_alive(holder):
-            say("holder ignored SIGTERM; sending SIGKILL to pid {}".format(holder.pid))
-            try:
-                os.kill(holder.pid, signal.SIGKILL)
-            except OSError:
-                pass
+            say("holder ignored the stop request; killing pid {}".format(holder.pid))
+            _compat.terminate_pid(holder.pid, force=True)
             try:
                 lock.acquire(2.0)
             except LockTimeout:
@@ -704,6 +766,26 @@ def acquire_daemon_lock(session: SessionPaths, socket_path: Path, replace: bool,
         else:
             return None, {"already_running": True, "replaced": False, "error": "daemon_lock_held"}
     return lock, {"replaced": True, "holder": holder.to_json() if holder else None}
+
+
+def _request_stop(session: SessionPaths, pid: int) -> None:
+    """Ask a running daemon to stop, the way this platform can.
+
+    unix: ``SIGTERM``. Windows: the stop-request file the daemon polls
+    (``taskkill`` cannot deliver a catchable signal to a detached,
+    console-less process).
+    """
+    if _compat.IS_WINDOWS:
+        try:
+            with open(stop_file(session), "w", encoding="utf-8") as handle:
+                handle.write(str(int(pid)))
+        except OSError:
+            pass
+        return
+    try:
+        os.kill(int(pid), signal.SIGTERM)
+    except OSError:
+        pass
 
 
 #: ``request_stop`` reason of the version watcher; the one exit that restarts itself.
@@ -724,8 +806,12 @@ def restart_argv(daemon: "Daemon") -> Optional[List[str]]:
         return None
     if os.environ.get("HERDR_TEAM_NO_SELF_RESTART") == "1":
         return None
+    if _compat.IS_WINDOWS:
+        # A ``.cmd`` launcher cannot be exec'd; the interpreter is used and
+        # the plugin root is put on PYTHONPATH so ``-m`` finds the package.
+        return [sys.executable, "-m", "herdr_team.cli", "daemon", "start"]
     launcher = plugin_root() / "bin" / "herdr-synapse"
-    if not os.access(os.fspath(launcher), os.X_OK):
+    if not _compat.is_executable(launcher):
         return None
     return [os.fspath(launcher), "daemon", "start"]
 
@@ -745,13 +831,31 @@ def forget_self(session: SessionPaths) -> None:
         pass
 
 
-def _grandchild_main(layout: Layout, env: Dict[str, str], replace: bool, status_fd: Optional[int], allow_version: bool, dry_nudge: bool) -> None:
-    """Runs in the detached grandchild; never returns."""
+def _grandchild_main(
+    layout: Layout,
+    env: Dict[str, str],
+    replace: bool,
+    status_fd: Optional[int],
+    allow_version: bool,
+    dry_nudge: bool,
+    status_path: Optional[Path] = None,
+) -> None:
+    """Runs in the detached grandchild; never returns.
+
+    On Windows this is the detached child process itself (there is no
+    fork): it reports through ``status_path`` instead of an inherited pipe
+    fd.
+    """
     session = layout.session
     exit_code = 1
+
+    def report(obj: Dict[str, Any]) -> None:
+        _write_status(status_fd, obj)
+        _write_status_file(status_path, obj)
+
     try:
         os.chdir(os.fspath(session.root))
-        null_fd = os.open("/dev/null", os.O_RDWR)
+        null_fd = os.open(_compat.DEV_NULL, os.O_RDWR)
         rotate_log(session.daemon_log)
         log_fd = _open_log_fd(session)
         os.dup2(null_fd, 0)
@@ -777,6 +881,11 @@ def _grandchild_main(layout: Layout, env: Dict[str, str], replace: bool, status_
             sys.stderr.write("{} [{}] {}\n".format(now_iso(), os.getpid(), message))
             sys.stderr.flush()
 
+        # A stop request left over from a previous run must not stop this one.
+        try:
+            stop_file(session).unlink()
+        except OSError:
+            pass
         try:
             wait_s = float(os.environ.get("HERDR_TEAM_LOCK_WAIT_S") or LOCK_TAKEOVER_WAIT_S)
         except ValueError:
@@ -784,7 +893,7 @@ def _grandchild_main(layout: Layout, env: Dict[str, str], replace: bool, status_
         lock, lock_info = acquire_daemon_lock(session, layout.socket, replace, wait_s=wait_s, log=log)
         if lock is None:
             lock_info.setdefault("status", "already_running")
-            _write_status(status_fd, {"status": "already_running", "daemon": lock_info.get("holder")})
+            report({"status": "already_running", "daemon": lock_info.get("holder")})
             log("another daemon holds the lock; exiting")
             exit_code = 0
             return
@@ -796,7 +905,7 @@ def _grandchild_main(layout: Layout, env: Dict[str, str], replace: bool, status_
             daemon.connect_server()
         except HerdrTeamError as err:
             if err.code == "herdr_version_mismatch":
-                _write_status(status_fd, {"status": "error", "error": err.to_json()})
+                report({"status": "error", "error": err.to_json()})
                 log("refusing to run: {}".format(err))
                 lock.release()
                 return
@@ -804,7 +913,7 @@ def _grandchild_main(layout: Layout, env: Dict[str, str], replace: bool, status_
         info = daemon.write_info(started=True)
         log("started pid {} start_time {!r} socket {} {}".format(info.pid, info.start_time, layout.socket, _stdio_description(session)))
         log("identity env unset: {}; session env unset: {}".format(_identity_env_unset(), _session_env_unset()))
-        _write_status(status_fd, {"status": "started", "replaced": bool(lock_info.get("replaced")), "daemon": info.to_json()})
+        report({"status": "started", "replaced": bool(lock_info.get("replaced")), "daemon": info.to_json()})
         if status_fd is not None:
             os.close(status_fd)
             status_fd = None
@@ -815,10 +924,21 @@ def _grandchild_main(layout: Layout, env: Dict[str, str], replace: bool, status_
             log("restarting on the new code: {}".format(" ".join(argv)))
             forget_self(session)
             os.chdir(os.fspath(plugin_root()))
-            os.execv(argv[0], argv)
+            if _compat.IS_WINDOWS:
+                # ``os.execv`` cannot exec a ``.cmd``; the restart is a
+                # detached child of the interpreter instead.
+                restart_env = dict(os.environ)
+                root = os.fspath(plugin_root())
+                existing = restart_env.get("PYTHONPATH")
+                restart_env["PYTHONPATH"] = root + (os.pathsep + existing if existing else "")
+                restart_env["HERDR_TEAM_ROOT"] = root
+                subprocess.Popen(argv, cwd=os.fspath(plugin_root()), env=restart_env,
+                                 stdin=subprocess.DEVNULL, stdout=None, stderr=None)
+            else:
+                os.execv(argv[0], argv)
     except BaseException as err:  # noqa: BLE001 - the grandchild must never unwind into the parent's code
         try:
-            _write_status(status_fd, {"status": "error", "error": {"code": "daemon_start_failed", "message": "{}: {}".format(type(err).__name__, err)}})
+            report({"status": "error", "error": {"code": "daemon_start_failed", "message": "{}: {}".format(type(err).__name__, err)}})
             sys.stderr.write("{} daemon crashed: {}: {}\n".format(now_iso(), type(err).__name__, err))
             sys.stderr.flush()
         except Exception:  # noqa: BLE001
@@ -833,12 +953,107 @@ def _grandchild_main(layout: Layout, env: Dict[str, str], replace: bool, status_
         os._exit(exit_code)
 
 
+def run_detached_child(
+    layout: Layout,
+    env: Mapping[str, str],
+    replace: bool,
+    status_path: Optional[Path],
+    allow_version: bool,
+    dry_nudge: bool,
+) -> None:
+    """Entry point of the Windows detached child (no fork on this platform)."""
+    scrubbed = scrub_env(env, DAEMON_DROPPED_ENV_VARS)
+    scrubbed["HERDR_SOCKET_PATH"] = os.fspath(layout.socket)
+    _grandchild_main(layout, dict(scrubbed), replace, None, allow_version, dry_nudge, status_path=status_path)
+
+
+def _detach_and_run_windows(
+    layout: Layout,
+    env: Mapping[str, str],
+    replace: bool,
+    allow_version: bool,
+    dry_nudge: bool,
+) -> Dict[str, Any]:
+    """Windows daemonization: a detached child that reports through a file.
+
+    There is no ``fork`` on Windows, so the daemon is spawned as a detached
+    process (``DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
+    CREATE_NO_WINDOW``) and the parent polls the status file the child
+    writes. The protocol and the result shape are the unix ones.
+    """
+    session = layout.session
+    status_path = session.root / "daemon.start.json"
+    try:
+        status_path.unlink()
+    except OSError:
+        pass
+    argv = [
+        sys.executable,
+        "-m",
+        "herdr_team.cli",
+        "daemon",
+        "start",
+        "--detach-child",
+        "--status-file",
+        os.fspath(status_path),
+    ]
+    if replace:
+        argv.append("--replace")
+    if allow_version:
+        argv.append("--allow-version")
+    if dry_nudge:
+        argv.append("--dry-nudge")
+    child_env = dict(os.environ)
+    child_env.update(scrub_env(env, DAEMON_DROPPED_ENV_VARS))
+    child_env["HERDR_SOCKET_PATH"] = os.fspath(layout.socket)
+    root = os.fspath(plugin_root())
+    existing = child_env.get("PYTHONPATH")
+    child_env["PYTHONPATH"] = root + (os.pathsep + existing if existing else "")
+    child_env["HERDR_TEAM_ROOT"] = root
+    t0 = time.monotonic()
+    try:
+        _compat.spawn_detached(argv, env=child_env, cwd=os.fspath(session.root))
+    except OSError as err:
+        return {
+            "status": "error",
+            "error": {"code": "daemon_start_failed", "message": "could not spawn the daemon: {}".format(err)},
+            "intermediate_exit_ms": (time.monotonic() - t0) * 1000.0,
+            "replaced": False,
+        }
+    result: Dict[str, Any] = {"status": "error", "error": {"code": "daemon_start_failed", "message": "daemon reported nothing"}}
+    deadline = time.monotonic() + STATUS_PIPE_TIMEOUT_S
+    while time.monotonic() < deadline:
+        try:
+            text = status_path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            text = ""
+        if text:
+            try:
+                parsed = json.loads(text.splitlines()[0])
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                result = parsed
+            else:
+                result = {"status": "error", "error": {"code": "daemon_start_failed", "message": "unparseable daemon report"}}
+            break
+        time.sleep(0.05)
+    result["intermediate_exit_ms"] = (time.monotonic() - t0) * 1000.0
+    result.setdefault("replaced", False)
+    return result
+
+
 def detach_and_run(layout: Layout, env: Mapping[str, str], replace: bool = False, allow_version: bool = False, dry_nudge: bool = False) -> Dict[str, Any]:
     """The double fork; returns in the original parent once the grandchild reported.
 
     The result is ``{"status": "started"|"already_running"|"error", "daemon": {...},
     "replaced": bool, "intermediate_exit_ms": float, "error": {...}}``.
+
+    Windows has no ``fork``: the detached child is spawned as a process and
+    reports through a status file instead of a pipe.
     """
+    if _compat.IS_WINDOWS:
+        return _detach_and_run_windows(layout, env, replace, allow_version, dry_nudge)
     session = layout.session
     ensure_session_dirs(session)
     scrubbed = scrub_env(env, DAEMON_DROPPED_ENV_VARS)
@@ -1427,6 +1642,9 @@ class TeamState:
     #: Asks still waiting on the operator, by seq; seeded from the board once,
     #: then kept current by ``_track_ask`` as records are ingested.
     open_asks: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    #: Superuser designation for ask reroute: pane/session verified against server.
+    superuser_pane: Optional[str] = None
+    superuser_session: Optional[str] = None
     #: ``(mtime, seqs)`` of ``dismissed-asks.json`` at the last read.
     dismissed_cache: Optional[Tuple[Optional[float], List[int]]] = None
     #: Messages delivered here across a link and not yet read by this team's
@@ -1557,6 +1775,19 @@ class Daemon:
         self.registry_poll_s = REGISTRY_POLL_S
         self.version_watch_s = VERSION_WATCH_S
         self.tick_s = TAIL_TICK_S
+        self.manager_nudge_interval_ticks = MANAGER_NUDGE_INTERVAL_TICKS
+        self.ticks_since_manager_nudge = 0
+        self.manager_assign_interval_ticks = MANAGER_ASSIGN_INTERVAL_TICKS
+        self.ticks_since_manager_assign = 0
+        self.leader_pending_interval_ticks = LEADER_PENDING_INTERVAL_TICKS
+        self.ticks_since_leader_pending = 0
+        self.manager_sweep_interval_ticks = MANAGER_SWEEP_INTERVAL_TICKS
+        self.ticks_since_manager_sweep = 0
+        self.idle_agent_interval_ticks = IDLE_AGENT_INTERVAL_TICKS
+        self.ticks_since_idle_agent = 0
+        #: Per-team fingerprint of the queue the last manager nudge reported, so a steady
+        #: queue does not append a board record every minute.
+        self.manager_nudge_state: Dict[str, Dict[str, Any]] = {}
         self.server_version: Optional[str] = None
         self.server_protocol: Optional[int] = None
         #: ``None`` until the live server has answered the zero-write probe.
@@ -1603,6 +1834,8 @@ class Daemon:
         self.last_heartbeat_ms: Optional[float] = None
         self.last_ping_at: Optional[str] = None
         self.connected_ms: Optional[float] = None
+        # When the last full pass (``tick``) ran: it runs at the tick's pace, not once per pane event.
+        self.last_pass_ms: Optional[float] = None
         self.reconcile_due = True
         self.console_check_due = False  # a pane.closed event: is the console's terminal still listed?
         self.console_reconcile_at_ms: Optional[float] = None  # deferred RT-05 pass after a connect
@@ -1703,8 +1936,14 @@ class Daemon:
             self.request_stop("signal {}".format(signum))
 
         previous: Dict[int, Any] = {}
+        # ``SIGHUP`` does not exist on Windows; the signals that do exist
+        # are still installed so a console CTRL_C stops the daemon cleanly.
+        signums = [signal.SIGTERM, signal.SIGINT]
+        sighup = getattr(signal, "SIGHUP", None)
+        if sighup is not None:
+            signums.append(sighup)
         try:
-            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            for signum in signums:
                 previous[signum] = signal.signal(signum, _stop)
         except (ValueError, OSError):
             self._restore_signals(previous)
@@ -1733,9 +1972,33 @@ class Daemon:
         if self.stop_reason is None:
             self.stop_reason = reason
 
+    def _stop_requested_by_file(self) -> bool:
+        """True when a stop request for this daemon is on disk.
+
+        Windows delivers no ``SIGTERM`` to a detached, console-less
+        process, so ``daemon stop`` writes ``<session>/daemon.stop`` and
+        the daemon polls it (unix keeps using the signal).
+        """
+        if not _compat.IS_WINDOWS:
+            return False
+        try:
+            text = stop_file(self.session).read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return False
+        if not text:
+            return False
+        try:
+            wanted = int(text)
+        except ValueError:
+            return True
+        return wanted == os.getpid()
+
     def _interruptible_sleep(self, seconds: float) -> None:
         deadline = self.clock() + seconds
         while not self.stop_requested:
+            if self._stop_requested_by_file():
+                self.request_stop("stop file")
+                return
             remaining = deadline - self.clock()
             if remaining <= 0:
                 return
@@ -1748,6 +2011,9 @@ class Daemon:
         self.log("run: socket {} inode {} dry_nudge={}".format(self.layout.socket, self.socket_inode, self.dry_nudge))
         try:
             while not self.stop_requested:
+                if self._stop_requested_by_file():
+                    self.request_stop("stop file")
+                    break
                 if not self._connect_with_backoff():
                     break
                 self._serve_subscription()
@@ -1822,6 +2088,9 @@ class Daemon:
         try:
             self.on_connected()
             while not self.stop_requested:
+                if self._stop_requested_by_file():
+                    self.request_stop("stop file")
+                    return
                 try:
                     event = next(stream)
                 except StopIteration:
@@ -1831,7 +2100,13 @@ class Daemon:
                     return
                 if event is not None:
                     self._phase("event", lambda: self.handle_event(event))
-                self.tick()
+                # The pass below is expensive - every team's board tail, every pending member's cursor, re-read from
+                # disk - and a pane's updates arrive many times a second (each line an agent draws is one event).
+                # Run at the pace of the busiest pane, the daemon lives inside it and costs most of a core. It runs
+                # at the tick's own pace instead; the event itself is still handled at once, above.
+                if self.last_pass_ms is None or self.now_ms() - self.last_pass_ms >= self.tick_s * 1000.0:
+                    self.last_pass_ms = self.now_ms()
+                    self.tick()
                 self.iterations += 1
                 if self.max_iterations is not None and self.iterations >= self.max_iterations:
                     self.request_stop("max iterations")
@@ -1856,6 +2131,7 @@ class Daemon:
         self.reconnect_requested = False
         self.last_agent_list_ms = None
         self.connected_ms = now
+        self.last_pass_ms = None  # a fresh subscription ticks at once, then at the tick's own pace
         self.console_reconcile_at_ms = self.now_ms() + CONSOLE_RECONCILE_DELAY_S * 1000.0
         self.console_reconcile_attempts = 0
         self.reconcile_due = True
@@ -1975,6 +2251,627 @@ class Daemon:
             self.counters["phase_errors"] += 1
             self.log("tick phase {} failed: {}: {}".format(name, type(err).__name__, err))
 
+    def manager_nudge_tick(self) -> None:
+        """Wake the members whose work is stuck, on two cadences.
+
+        The owners of unclaimed work and the reviewers of settled work are woken every
+        ``MANAGER_NUDGE_INTERVAL_TICKS`` ticks: their queue is what makes the tracker move,
+        and a minute of silence is a minute of nothing happening. The manager -- who
+        judges and assigns -- is woken every ``MANAGER_ASSIGN_INTERVAL_TICKS`` ticks
+        instead: a judgement call is not a per-minute event, and a manager pinged every
+        minute learns to ignore the ping.
+
+        The daemon never assigns. It reports the queue and wakes the one member who can
+        act on it, as ordinary named system events, so the existing nudge ladder (gate,
+        follow-up, re-nudge) applies to them unchanged.
+        """
+        self.ticks_since_manager_nudge += 1
+        self.ticks_since_manager_assign += 1
+        self.ticks_since_leader_pending += 1
+        self.ticks_since_manager_sweep += 1
+        self.ticks_since_idle_agent += 1
+        owners_due = self.ticks_since_manager_nudge >= self.manager_nudge_interval_ticks
+        assign_due = self.ticks_since_manager_assign >= self.manager_assign_interval_ticks
+        leader_due = self.ticks_since_leader_pending >= self.leader_pending_interval_ticks
+        sweep_due = self.ticks_since_manager_sweep >= self.manager_sweep_interval_ticks
+        idle_due = self.ticks_since_idle_agent >= self.idle_agent_interval_ticks
+        if not (owners_due or assign_due or leader_due or sweep_due or idle_due):
+            return
+        if owners_due:
+            self.ticks_since_manager_nudge = 0
+        if assign_due:
+            self.ticks_since_manager_assign = 0
+        if leader_due:
+            self.ticks_since_leader_pending = 0
+        if sweep_due:
+            self.ticks_since_manager_sweep = 0
+        if idle_due:
+            self.ticks_since_idle_agent = 0
+        for team in list(self.teams.values()):
+            try:
+                self._nudge_manager_for_team(team, owners=owners_due, assign=assign_due)
+            except Exception as err:  # noqa: BLE001 - F-07: one bad team must not stop the others
+                self.log("manager_nudge for {} failed: {}".format(team.name, err))
+            if leader_due:
+                try:
+                    self._nudge_leader_for_team(team)
+                except Exception as err:  # noqa: BLE001 - one bad team must not stop the others
+                    self.log("leader_pending for {} failed: {}".format(team.name, err))
+            if sweep_due:
+                try:
+                    self._nudge_manager_sweep_for_team(team)
+                except Exception as err:  # noqa: BLE001 - one bad team must not stop the others
+                    self.log("manager_sweep for {} failed: {}".format(team.name, err))
+            if idle_due:
+                try:
+                    self._nudge_idle_agents_for_team(team)
+                except Exception as err:  # noqa: BLE001 - one bad team must not stop the others
+                    self.log("idle_agent for {} failed: {}".format(team.name, err))
+
+    def _nudge_manager_for_team(self, team: TeamState, owners: bool = True, assign: bool = True) -> None:
+        """Wake the owners, the reviewers and the manager whose work items are stuck."""
+        from herdr_team import work as _work
+
+        manager = team.manager_name()
+        items = _work.load(team.paths)
+        if not items:
+            return
+        to_claim: Dict[str, List[Any]] = {}
+        to_review: Dict[str, List[Any]] = {}
+        unassigned: List[Any] = []
+        for item in _work.sorted_items(items):
+            if item.status == _work.STATUS_OPEN:
+                if _work.is_ready(item, items):
+                    unassigned.append(item)
+            elif item.status == _work.STATUS_ASSIGNED and item.attempt is None:
+                # Assigned but never claimed: its owner is the only one who can start it.
+                if item.owner and _work.is_ready(item, items):
+                    to_claim.setdefault(str(item.owner), []).append(item)
+            elif item.status == _work.STATUS_IN_REVIEW:
+                for reviewer in item.review_by:
+                    name = str(reviewer)
+                    if name == "human":
+                        # Nothing waits on the operator: the verdict goes to a seat that
+                        # can give it. The manager takes it, unless the manager owns the
+                        # item -- a seat never reviews its own work -- and then the lead
+                        # takes it.
+                        holder = manager if (manager and manager != item.owner) else self._leader_name(team)
+                        if holder and holder != item.owner:
+                            to_review.setdefault(holder, []).append(item)
+                        continue
+                    to_review.setdefault(name, []).append(item)
+        now = self.now_ms()
+        if owners:
+            # An owner told to claim and did not is woken first: the manager cannot adjudicate
+            # a claim it has not been told about.
+            for owner, owned in sorted(to_claim.items()):
+                ids = [i.id for i in owned]
+                text = ("WORK NUDGE: {} item(s) are ready and assigned to you but not claimed: {}. "
+                        "Claim each one with `herdr-synapse --team {} work claim <W-ID>`, then do it. "
+                        "Briefs: `herdr-synapse --team {} work list --json`.".format(len(ids), ", ".join(ids), team.name, team.name))
+                self._emit_manager_nudge(team, owner, "work_ready", text,
+                                         {"work": {"ids": ids, "op": "claim"}}, now)
+            for reviewer, pending in sorted(to_review.items()):
+                ids = [i.id for i in pending]
+                forwarded = [i for i in pending if "human" in i.review_by]
+                if forwarded:
+                    # The forwarded case: the operator is named, but the verdict is an
+                    # agent's to give.
+                    text = ("WORK NUDGE: {} item(s) are settled and waiting for a verdict whose reviewer is the "
+                            "operator: {}. The verdict is yours: review each one with "
+                            "`herdr-synapse --team {} work review <W-ID> --approve`, or ask for changes with "
+                            "`herdr-synapse --team {} work review <W-ID> --changes 'what to fix'`, and take it to "
+                            "the lead. Nothing here waits on the operator.".format(
+                                len(forwarded), ", ".join(i.id for i in forwarded), team.name, team.name))
+                else:
+                    text = ("WORK NUDGE: {} item(s) are settled and waiting for your review: {}. "
+                            "Approve with `herdr-synapse --team {} work review <W-ID> --approve`, or ask for changes with "
+                            "`herdr-synapse --team {} work review <W-ID> --changes \"what to fix\"`.".format(len(ids), ", ".join(ids), team.name, team.name))
+                self._emit_manager_nudge(team, reviewer, "work_review", text,
+                                         {"work": {"ids": ids, "op": "review"}}, now)
+        if not assign:
+            return
+        if not manager or not unassigned:
+            return
+        ids = [i.id for i in unassigned]
+        text = ("MANAGER NUDGE: {} item(s) are ready but unassigned: {}. Judge and assign each one with "
+                "`herdr-synapse --team {} work assign <W-ID> <member>`. List: "
+                "`herdr-synapse --team {} work list --json`.".format(len(ids), ", ".join(ids), team.name, team.name))
+        self._emit_manager_nudge(team, manager, "manager_nudge", text,
+                                 {"work": {"ids": ids, "op": "assign"}}, now)
+
+    def _leader_name(self, team: TeamState) -> Optional[str]:
+        """The member who leads this team (the roster role ``lead``), when there is one.
+
+        The manager is the fallback: a team with no lead still has one seat that can
+        judge, and a digest with nowhere to go is a digest that is not sent.
+        """
+        for m in team.members():
+            if m.get("role") == "lead" and m.get("kind") != "human" and m.get("status") != "left":
+                name = m.get("name")
+                return str(name) if isinstance(name, str) else None
+        return team.manager_name()
+
+    def _pending_items(self, items: Dict[str, Any], now: float) -> List[Tuple[Any, str, str, str]]:
+        """Every item that cannot move on their own: why it waits, what moves it, whose job.
+
+        The lane is the split the team runs on: **routing and approvals are the
+        manager's** (assign it, re-assign it, give the verdict, re-point a
+        verdict, nudge an owner who has gone quiet), and **decisions and
+        planning are the lead's** (rule on it, cancel it, drop a dead
+        dependency, take it and give it a solution path). An item lands in one
+        lane, and each seat is told about its own lane only -- so neither seat
+        is doing the other's job.
+        """
+        from herdr_team import work as _work
+
+        out: List[Tuple[Any, str, str, str]] = []
+        for item in _work.sorted_items(items):
+            dead = [d for d in item.deps
+                    if items.get(d) is not None and items[d].status in (_work.STATUS_CANCELLED, _work.STATUS_FAILED)]
+            if dead and item.status in (_work.STATUS_OPEN, _work.STATUS_ASSIGNED):
+                out.append((
+                    item,
+                    "waits on {} which ended {}".format(
+                        ", ".join(dead), "/".join(sorted({items[d].status for d in dead}))),
+                    "drop the dead dependency (work update {} --deps ...) or cancel it".format(item.id),
+                    "lead"))
+                continue
+            if item.status == _work.STATUS_OPEN:
+                if _work.is_ready(item, items):
+                    out.append((item, "ready and nobody owns it",
+                                "assign it (work assign {} <member>)".format(item.id),
+                                "manager"))
+                continue
+            if item.status == _work.STATUS_ASSIGNED and item.attempt is None:
+                out.append((
+                    item,
+                    "assigned to {} and never claimed".format(item.owner or "nobody"),
+                    "the owner claims it (work claim {}), or re-assign it".format(item.id),
+                    "manager"))
+                continue
+            if item.status == _work.STATUS_IN_REVIEW:
+                out.append((
+                    item,
+                    "settled and waiting for review by {}".format(", ".join(item.review_by) or "nobody named"),
+                    "review it (work review {} --approve) or ask for changes "
+                    "(work review {} --changes ...)".format(item.id, item.id),
+                    "manager"))
+                continue
+            if item.status == _work.STATUS_BLOCKED:
+                out.append((
+                    item,
+                    "blocked: {}".format(item.block_reason or "no reason given"),
+                    "the owner clears it (work unblock {}), or you rule it "
+                    "(work rule {} --outcome <slug> --status <status> --summary ...)".format(item.id, item.id),
+                    "lead"))
+                continue
+            if item.status == _work.STATUS_CHANGES:
+                # The reviewer asked for changes, so the REVIEWER is waiting on the
+                # owner to act and settle again. The reviewer is the seat that
+                # asked, and the seat that asked is the one that has to chase --
+                # that is routing, and routing is the manager's. Putting it in
+                # the lead's lane gave the lead a digest entry whose only action
+                # was one the lead cannot take: only the owner can settle an
+                # item. The lead rules on an item that needs a decision, and this
+                # one does not need one yet; it needs the owner to move. If the
+                # owner cannot move it, it becomes a decision -- the owner blocks
+                # it with the reason, and it lands in the lead's lane.
+                out.append((
+                    item,
+                    "the reviewer asked for changes and is waiting on the owner",
+                    "the owner acts on it and settles it (board --from {} --last 5, work show {}); "
+                    "if the owner cannot, it needs a ruling - the owner blocks it with the reason".format(
+                        item.owner or "the owner", item.id),
+                    "manager"))
+                continue
+            if item.status == _work.STATUS_IN_PROGRESS and item.attempt is not None:
+                # In flight, but nobody is moving it: the work module's own quiet rule.
+                claimed = _work.store_parse_iso(item.attempt.claimed_at)
+                last = _work.store_parse_iso(item.updated_at) or claimed
+                if last is not None and now - last > _work.QUIET_AFTER_S:
+                    # Say whether the owner has an outside reason to be quiet. An
+                    # owner whose dependency is still unfinished is waiting for
+                    # something; an owner whose dependency is done has no reason
+                    # but its own, and saying so turns the nudge from a question
+                    # into an instruction. Without this, a seat reads the open
+                    # list, does not see its dependency among the open items,
+                    # calls itself blocked, and the cycle repeats.
+                    waiting = [d for d in item.deps
+                               if items.get(d) is not None and items[d].status not in _work.FINAL]
+                    missing = [d for d in item.deps if d not in items]
+                    if waiting:
+                        why = ("in progress but quiet for {:.0f} h under {}, and {} is not finished"
+                               .format((now - last) / 3600.0, item.attempt.owner, ", ".join(waiting)))
+                    elif missing:
+                        why = ("in progress but quiet for {:.0f} h under {}, and it waits on {}, "
+                               "which is not a tracked work item"
+                               .format((now - last) / 3600.0, item.attempt.owner, ", ".join(missing)))
+                    else:
+                        why = ("in progress but quiet for {:.0f} h under {}, and nothing it depends "
+                               "on is unfinished"
+                               .format((now - last) / 3600.0, item.attempt.owner))
+                    out.append((
+                        item,
+                        why,
+                        "nudge the owner (board --from {} --last 5) or re-assign it".format(
+                            item.attempt.owner),
+                        "manager"))
+                continue
+        return out
+
+    def _member_idle(self, team: TeamState, member: Dict[str, Any]) -> bool:
+        """Is this member sitting in its pane with nothing running?
+
+        The daemon knows two things: what Herdr reports about the agent (idle,
+        working, blocked, done) and what the tracker says it holds. A member that
+        Herdr calls idle and that holds work nobody can move is waiting around.
+        """
+        if member.get("kind") == "human" or member.get("status") != "active":
+            return False
+        terminal_id = member.get("terminal_id")
+        agent = self.agents.get(terminal_id) if terminal_id else None
+        if not agent:
+            return False
+        status = str(agent.get("agent_status") or "").lower()
+        return status in ("idle", "done")
+
+    def _waiting_on(self, item: Any, items: Dict[str, Any], manager: Optional[str]) -> Optional[str]:
+        """Who this item is waiting on, when the answer is a person."""
+        from herdr_team import work as _work
+
+        if item.status == _work.STATUS_BLOCKED:
+            return str(item.requester or manager or "human")
+        if item.status == _work.STATUS_IN_REVIEW:
+            for reviewer in item.review_by:
+                if reviewer != "human":
+                    return str(reviewer)
+            return str(manager or "human")
+        if item.status == _work.STATUS_ASSIGNED and item.attempt is None:
+            return str(manager or "human")
+        return None
+
+    def _recently_asked(self, team: TeamState, name: str, people: Sequence[str], now: float) -> bool:
+        """Has this seat already asked these people, recently?
+
+        The idle nudge exists to make an idle seat ask. A seat that asked and
+        is waiting for the answer does not need the same words again: the
+        manager's sweep names it as idle every five minutes, and the answer
+        wakes it. Repeating the nudge only fills the board with the same
+        question twice.
+        """
+        if not people:
+            return False
+        try:
+            records = store.BoardStore(team.paths).read(last=400, include_retracted=False)
+        except Exception:  # noqa: BLE001 - a board read must not stop the nudge
+            return False
+        cutoff = now - IDLE_ASKED_WINDOW_S
+        for record in records:
+            if record.get("from") != name:
+                continue
+            if not any(p in (record.get("to") or []) for p in people):
+                continue
+            if record.get("kind") not in ("request", "question", "note", "answer"):
+                continue
+            stamp = _parse_iso(record.get("ts"))
+            if stamp is None or stamp >= cutoff:
+                return True
+        return False
+
+    def _nudge_idle_agents_for_team(self, team: TeamState) -> None:
+        """Wake the seats that are sitting idle, so they drive their own work.
+
+        An idle agent that holds an item nobody can move is the shape that quietly
+        stalls a team: it waits for a stakeholder instead of asking one. The nudge
+        says what to do instead of waiting -- ping the person it is waiting on, do
+        what can be done, and ask the team manager for items to claim when there is
+        nothing.
+
+        The manager is the one who assigns, so the manager is the one an idle seat
+        asks: a seat that wants work pings the manager, and the manager's sweep
+        (the same five-minute beat) tells it who is idle.
+        """
+        from herdr_team import work as _work
+
+        lead = self._leader_name(team)
+        manager = team.manager_name()
+        items = _work.load(team.paths)
+        if not items:
+            # Nothing to ask for: a team with no work has nothing for an idle seat to
+            # be given, so the nudge would be noise.
+            return
+        now = self.now_ms()
+        for member in team.members():
+            name = str(member.get("name"))
+            if not self._member_idle(team, member):
+                continue
+            held = [i for i in _work.sorted_items(items)
+                    if i.owner == name and i.status in (_work.STATUS_ASSIGNED, _work.STATUS_IN_PROGRESS,
+                                                        _work.STATUS_BLOCKED, _work.STATUS_CHANGES)]
+            if not held:
+                # Idle with nothing in flight: the manager decides what this seat takes next.
+                if self._recently_asked(team, name, [manager] if manager else [], self.wall_clock()):
+                    continue  # it already asked; the manager's sweep names it as idle
+                if name == manager:
+                    text = ("IDLE NUDGE: you are the team manager and you are idle, holding no work item. "
+                            "Assign the ready work to the idle seats yourself: "
+                            "`herdr-synapse --team {} work list --ready --json`, then "
+                            "`herdr-synapse --team {} work assign <W-ID> <member>`. If a seat is waiting on "
+                            "items to claim, answer it.".format(team.name, team.name))
+                else:
+                    text = ("IDLE NUDGE: you are idle and hold no work item. Ask the team manager ({}) for items "
+                            "to claim: post to {} with what you can take, and do it now rather than waiting to be "
+                            "asked. Ready queue: `herdr-synapse --team {} work list --ready --json`.".format(
+                                manager or lead or "the manager", manager or lead or "the manager", team.name))
+                self._emit_manager_nudge(team, name, "idle_agent", text,
+                                         {"work": {"ids": [], "op": "idle"}}, now,
+                                         signature=["idle:no-items"])
+                continue
+            lines = []
+            signature = []
+            for item in held:
+                waiting = self._waiting_on(item, items, manager)
+                if waiting is None:
+                    continue
+                signature.append("{}:{}:{}".format(item.id, item.status, waiting))
+                lines.append("- {} is {} and waits on {}: ping {} on the board, do the part you can, "
+                             "and if it is truly blocked say so".format(item.id, item.status, waiting, waiting))
+            if not lines:
+                continue
+            text = ("IDLE NUDGE: you are idle while holding {} item(s) that are waiting on someone else. "
+                    "Do not wait: {}. If you have nothing else, ask the team manager ({}) for items to claim. "
+                    "Ready queue: `herdr-synapse --team {} work list --ready --json`.".format(
+                        len(lines), "; ".join(lines), manager or lead or "the manager", team.name))
+            self._emit_manager_nudge(team, name, "idle_agent", text,
+                                     {"work": {"ids": [i.id for i in held], "op": "idle"}}, now,
+                                     signature=signature)
+
+    def _nudge_manager_sweep_for_team(self, team: TeamState) -> None:
+        """The manager's periodic sweep: idle seats, unassigned work, verdicts, asks.
+
+        One record every ``MANAGER_SWEEP_INTERVAL_TICKS`` that names what the team
+        is waiting on and who is waiting: the seats that are idle, the items nobody
+        owns, the verdicts nobody has given, and the asks still open. The manager
+        assigns, nudges and clears; the daemon only reports.
+        """
+        from herdr_team import asks as _asks
+        from herdr_team import work as _work
+
+        manager = team.manager_name()
+        if not manager:
+            return
+        items = _work.load(team.paths)
+        if not items:
+            return
+        now = self.now_ms()
+        lead = self._leader_name(team)
+        idle: List[str] = []
+        for member in team.members():
+            if not self._member_idle(team, member):
+                continue
+            name = str(member.get("name"))
+            # What the seat still holds, not what it ever held: a closed item is
+            # not work in flight, and saying otherwise makes the manager think a
+            # seat is busy when it is free.
+            held = [i.id for i in _work.sorted_items(items)
+                    if i.owner == name and i.status not in _work.FINAL]
+            idle.append("{} ({})".format(name, ", ".join(held) if held else "holds nothing"))
+        # Routing and approvals are the manager's lane: assign, re-assign, give the
+        # verdict, nudge an owner who has gone quiet. The lead's lane (rulings,
+        # plans, the complex execution) is not the manager's to move.
+        pending = self._pending_items(items, self.wall_clock())
+        mine = [row for row in pending if row[3] == "manager"]
+        # An item whose owner is also its reviewer can never be closed: a seat never
+        # reviews its own work. Reassigning the item can create that shape.
+        unreviewable = [i for i in _work.sorted_items(items)
+                        if i.owner and i.owner in (i.review_by or []) and i.status not in _work.FINAL]
+        # The standing split puts approvals with the manager. An item that names the
+        # lead as its reviewer is an approval sitting in the wrong lane: the manager
+        # re-points it rather than handing the lead a management duty.
+        misrouted = [i for i in _work.sorted_items(items)
+                     if i.status == _work.STATUS_IN_REVIEW and lead and lead in (i.review_by or [])
+                     and manager not in (i.review_by or []) and i.owner != manager]
+        try:
+            open_asks = _asks.pending(team.paths, _asks.dismissed(team.paths))
+        except Exception:  # noqa: BLE001 - an asks read must not stop the sweep
+            open_asks = []
+        if not (idle or mine or open_asks or unreviewable or misrouted):
+            return
+        lines: List[str] = []
+        if idle:
+            lines.append("- idle seats (they asked you for items to claim): {} "
+                         "(give them work: work assign <W-ID> <member>)".format("; ".join(idle)))
+        for item, why, action, _lane in mine:
+            lines.append("- {} ({}): {} -> {}".format(item.id, item.status, why, action))
+        if unreviewable:
+            lines.append("- nobody may review these (the owner is the reviewer): {} "
+                         "(re-point the verdict: work update <W-ID> --review-by <seat>)".format(
+                             ", ".join(i.id for i in unreviewable)))
+        if misrouted:
+            lines.append("- these name the lead as reviewer, and an approval is the manager's: {} "
+                         "(re-point them: work update <W-ID> --review-by {})".format(
+                             ", ".join(i.id for i in misrouted), manager))
+        if open_asks:
+            # Name the asks, not just their number: the manager takes them over and
+            # answers them, so the operator is not the only one who can close them.
+            named = ", ".join("#{} from {}".format(a.get("seq"), a.get("from")) for a in open_asks[:6])
+            lines.append("- asks still open for the operator: {} (take them over and answer them; "
+                         "the operator is the escalator, not the queue)".format(named))
+        header = ("MANAGER SWEEP: {} thing(s) are waiting on the team, and routing and approvals are "
+                  "yours. The lead is {}; it decides, rules and plans, and you do not need to ask it "
+                  "to move anything.".format(len(lines), lead or "the manager"))
+        footer = "Detail: `herdr-synapse --team {} work list --json`; seats: `herdr-synapse --team {} who`.".format(team.name, team.name)
+        text = header + "\n" + "\n".join(lines) + "\n" + footer
+        # The signature is what says "the same words again say nothing". It has to
+        # cover EVERYTHING the words say: the counts, the ids, the names, and the
+        # reasons. A signature that carries only the counts and the ids drops a
+        # changed reason -- "quiet for 14 h" becoming "quiet for 15 h", or a quiet
+        # owner whose dependency has since finished -- and the manager never sees
+        # the newer truth, because the sweep is deduped away as unchanged.
+        signature = ["|".join([
+            "idle=" + ",".join(idle),
+            "work=" + "|".join(i.id for i, _w, _a, _l in mine),
+            "why=" + "|".join(why for _i, why, _a, _l in mine),
+            "unreviewable=" + ",".join(i.id for i in unreviewable),
+            "misrouted=" + ",".join(i.id for i in misrouted),
+            "asks=" + ",".join(str(a.get("seq")) for a in open_asks),
+        ])]
+        self._emit_manager_nudge(team, manager, "manager_sweep", text,
+                                 {"work": {"ids": [i.id for i, _w, _a, _l in mine] +
+                                                 [i.id for i in unreviewable] +
+                                                 [i.id for i in misrouted],
+                                           "op": "sweep"}}, now, signature=signature)
+
+    def _nudge_leader_for_team(self, team: TeamState) -> None:
+        """Send the team's lead the pending items that are its to decide.
+
+        The lead is in charge of high-level analysis, decisions, planning and the
+        complex execution: the item that needs a ruling, a decision, a plan, or the
+        lead itself. The item that needs ROUTING or an APPROVAL is the manager's
+        (assign, re-assign, give the verdict, nudge an owner) and the lead is told
+        how many there are without being asked to move them. This is a report, not
+        an assignment -- it names what waits and what to run, and the lead decides.
+        """
+        from herdr_team import work as _work
+
+        lead = self._leader_name(team)
+        if not lead:
+            return
+        items = _work.load(team.paths)
+        if not items:
+            return
+        now = self.now_ms()
+        # The quiet rule compares an item's last change (wall time) with the wall
+        # clock: the daemon's own clock is monotonic, so it cannot be compared with
+        # a stored timestamp at all.
+        pending = self._pending_items(items, self.wall_clock())
+        if not pending:
+            return
+        mine = [row for row in pending if row[3] == "lead"]
+        theirs = [row for row in pending if row[3] != "lead"]
+        if not mine:
+            return
+        ids = [item.id for item, _why, _action, _lane in mine]
+        signature = ["{}:{}:{}".format(item.id, item.status, why) for item, why, _action, _lane in mine]
+        lines = ["- {} ({}): {} -> {}".format(item.id, item.status, why, action)
+                 for item, why, action, _lane in mine]
+        header = ("LEAD PENDING: {} item(s) need a decision, a plan, or the lead itself. Resolve each "
+                  "one, or take it and give it a solution path. Routing and approvals are the "
+                  "manager's, not yours. Prefix every command with "
+                  "`herdr-synapse --team {} `.".format(len(mine), team.name))
+        footer = "Full list: `herdr-synapse --team {} work list --json`.".format(team.name)
+        if theirs:
+            footer += (" The manager has {} more ({}); those are routing and approvals, and you do "
+                       "not need to move them.".format(len(theirs), ", ".join(i.id for i, _w, _a, _l in theirs)))
+        # Keep as many lines as fit: a digest that says one item and hides nineteen
+        # is not the pending list, it is a sample of it.
+        kept: List[str] = []
+        used = len(header) + len(footer) + 2
+        for line in lines:
+            if used + len(line) + 1 > 1900 and kept:
+                break
+            kept.append(line)
+            used += len(line) + 1
+        dropped = len(lines) - len(kept)
+        if dropped:
+            kept.append("- and {} more (see the full list below)".format(dropped))
+        text = header + "\n" + "\n".join(kept) + "\n" + footer
+        self._emit_manager_nudge(team, lead, "leader_pending", text,
+                                 {"work": {"ids": ids, "op": "pending"}}, now,
+                                 signature=signature)
+
+    def _emit_manager_nudge(self, team: TeamState, target: str, event: str, text: str,
+                            extra: Dict[str, Any], now: float,
+                            signature: Optional[Sequence[str]] = None) -> None:
+        """Append one board record for ``target``, but only when it would say something new.
+
+        Three rules keep the board readable. A record is written when the target has work it
+        was NOT told about (the set grew), or when its last word is older than the re-wake
+        interval (the nudge ladder itself gives up after ``RENUDGE_AFTER_S``). A set that
+        only shrank -- the target claimed what it was told -- needs no new record: the
+        items left are the ones the last record already named, and a record for them would
+        say nothing new. And a target that has not read its last nudge needs no second
+        copy: the same words again say nothing, and the daemon's own nudge ladder keeps
+        re-prompting the record it already has.
+
+        ``signature`` is for a digest whose CONTENT can change while its ids stay the
+        same: a pending item that moves from blocked to waiting-for-review is a different
+        thing to read, even though the id is the same. With a signature, a change in the
+        digest counts as news.
+        """
+        member = team.member(target)
+        if member is None or not member.get("terminal_id"):
+            return
+        work_extra = extra.get("work") or {}
+        ids = [str(i) for i in (work_extra.get("ids") or [])]
+        # Keyed by operation too: a member with both a claim and a review waiting has two
+        # queues, and one must not overwrite the other's mark.
+        key = "{}|{}".format(target, work_extra.get("op") or "")
+        state = self.manager_nudge_state.setdefault(team.name, {})
+        seen = state.get(key) or {}
+        told = set(str(i) for i in (seen.get("ids") or []))
+        grew = bool(set(ids) - told)
+        changed = False
+        if signature is not None:
+            previous = seen.get("signature")
+            changed = previous is not None and list(previous) != list(signature)
+        stale = (now - float(seen.get("at_ms") or 0.0)) >= MANAGER_NUDGE_REWAKE_S
+        # ``at_ms`` marks "this target was already told": a nudge with no ids (an idle
+        # seat that holds nothing) has no set to grow, so the mark is what says the
+        # words were already said.
+        if seen.get("at_ms") and not grew and not changed and not stale:
+            return
+        # A target that has not read its last nudge needs no second copy: the same words
+        # again say nothing new, and the daemon's own nudge ladder keeps re-prompting the
+        # record it already has (so nothing is lost by not adding another one).
+        last_seq = seen.get("seq")
+        if last_seq:
+            try:
+                cursor = read_cursor_seq(team.paths, target)
+            except Exception:  # noqa: BLE001 - a cursor read must not stop the nudge
+                cursor = 0
+            # An unread digest is not repeated: the same words again say nothing, and
+            # the daemon's own nudge ladder keeps re-prompting the record the target
+            # already has. But a digest that SAYS SOMETHING NEW is written even when
+            # the last one is unread: the ladder re-prompts the last record, so a new
+            # item that is not in it would be invisible until the target reads.
+            if cursor < int(last_seq) and not (grew or changed):
+                return
+        seq = self._append_system(team, event, text, to=[target], extra=extra)
+        if seq is None:
+            # The record was refused: leave the target unmarked so the next tick retries it.
+            return
+        state[key] = {"ids": ids, "at_ms": now, "seq": seq,
+                      "signature": list(signature) if signature is not None else None}
+        self._save_manager_nudge_state(team)
+        self.log("{}: nudged {} for {} ({} items)".format(team.name, target, event, len(ids)))
+
+    def _load_manager_nudge_state(self, team: TeamState) -> None:
+        """Resume what was last reported to each member, so a restart does not re-report it.
+
+        Without this the state is only in memory, and every daemon restart re-nudges every
+        member for work they were already told about -- the burst that made a member's
+        board unreadable on 2026-10-31.
+        """
+        try:
+            doc = store.read_json(team.paths.manager_nudge_state, default=None)
+        except (HerdrTeamError, OSError, ValueError):
+            doc = None
+        if not isinstance(doc, dict):
+            return
+        state = doc.get("targets")
+        if isinstance(state, dict):
+            self.manager_nudge_state[team.name] = {str(k): v for k, v in state.items() if isinstance(v, dict)}
+
+    def _save_manager_nudge_state(self, team: TeamState) -> None:
+        """Persist the per-member mark so the next daemon start resumes from it."""
+        state = self.manager_nudge_state.get(team.name) or {}
+        try:
+            store.write_json(team.paths.manager_nudge_state, {"v": 1, "targets": state})
+        except (HerdrTeamError, OSError, ValueError) as err:
+            self.log("{}: manager nudge state not saved: {}".format(team.name, err))
+
     def tick(self) -> None:
         now = self.now_ms()
         if self.ping_failures >= PING_FAILURES_BEFORE_RECONNECT and not self.reconnect_requested:
@@ -2014,6 +2911,7 @@ class Daemon:
         self._phase("canvas_snapshot", lambda: self.snapshot_all_canvases(now))
         self._phase("session_names", self.poll_session_names)
         self._phase("evaluate_pending", self.evaluate_pending)
+        self._phase("manager_nudge", lambda: self.manager_nudge_tick())
         self._phase("heartbeat", lambda: self.heartbeat_if_due(now))
         self._phase("notifications", self.process_notifications)
         self._phase("who", lambda: self.write_who_if_due(now))
@@ -2111,6 +3009,7 @@ class Daemon:
             team = TeamState(name, paths, Ledger(paths))
             self._reload_roster(team)
             self._load_tail_state(team)
+            self._load_manager_nudge_state(team)
             self._replay_ledger(team)
             self.teams[name] = team
             self.who_dirty = True
@@ -3424,6 +4323,11 @@ class Daemon:
             rt.last_headline = task_headline(member, rec, time.time())
         if "human" in [t for t in rec.get("to", []) if isinstance(t, str)] and author != "human":
             team.human_queue.append(rec)
+            # W-16 ask reroute: if a designated superuser exists for this team,
+            # also nudge that member so the ask reaches them instead of the operator.
+            rerouted = self._reroute_to_superuser(team, rec, team.paths)
+            if rerouted:
+                self._add_pending(team, rerouted, rec.get("seq"), False, author, now, interrupt=False)
         for name, urgent, interrupt in self._nudge_targets(team, rec):
             self._add_pending(team, name, seq, urgent, author, now, interrupt=interrupt)
 
@@ -3481,6 +4385,68 @@ class Daemon:
                 out.append((str(recipient.get("name")), urgent, interrupt))
         return out
 
+    def _reroute_to_superuser(self, team: TeamState, rec: Dict[str, Any], paths: TeamPaths) -> Optional[str]:
+        """W-16: return the designated superuser member name for ask reroute, else None.
+
+        The AUTHORITATIVE store is the W-16 registry
+        (``<session>/superuser_designations.json``) - the same file
+        ``identity`` reads to grant the authority. The mirror files
+        (``<team_dir>/superuser-designation.json`` for a per-team
+        designation, ``<session_root>/superuser-designation.json`` for a
+        global one) are a SECONDARY copy, and a secondary copy drifts: a team
+        that moves or is renamed leaves its mirror behind, and the reroute
+        then goes silent while the authority still holds. So the registry is
+        consulted when no mirror names a superuser.
+
+        A designation is session-wide; the pane is matched against THIS
+        team's roster below, so the reroute fires only for a team that really
+        has that pane as a member.
+        """
+        # Priority 1: the per-team mirror (the most specific one).
+        session_root = paths.root.parent
+        for desig_path in (paths.root / "superuser-designation.json",
+                           session_root / "superuser-designation.json"):
+            if not desig_path.is_file():
+                continue
+            try:
+                desig = json.loads(desig_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            if not isinstance(desig, dict):
+                continue
+            pane = desig.get("pane")
+            session_id = desig.get("session")
+            if pane and session_id:
+                team.superuser_pane = pane
+                team.superuser_session = session_id
+                break
+        # Priority 2: the authoritative W-16 registry, when no mirror names one.
+        if not team.superuser_pane or not team.superuser_session:
+            try:
+                from herdr_team import superuser_designations as _sds
+
+                for entry in _sds.DesignationRegistry(self.session).list_designations():
+                    if not entry.get("active"):
+                        continue
+                    pane = entry.get("pane_id")
+                    session_id = entry.get("session_id")
+                    if pane and session_id:
+                        team.superuser_pane = pane
+                        team.superuser_session = session_id
+                        break
+            except Exception:  # noqa: BLE001 - a broken registry must not stop the daemon
+                pass
+        if not team.superuser_pane or not team.superuser_session:
+            return None
+        kind = rec.get("kind", "")
+        if kind in ("question", "request", "blocked", "note", "handoff"):
+            # Find member by pane_id in the roster
+            for m in team.members():
+                if m.get("pane_id") == team.superuser_pane:
+                    name = m.get("name")
+                    return str(name) if isinstance(name, str) else None
+        return None
+
     def _track_ask(self, team: TeamState, rec: Dict[str, Any]) -> None:
         """Keep ``team.open_asks`` current from the records already flowing past.
 
@@ -3497,7 +4463,7 @@ class Daemon:
             team.open_asks[seq] = rec
             while len(team.open_asks) > OPEN_ASKS_MAX:
                 team.open_asks.pop(min(team.open_asks))
-        answered = _asks.answered_by(rec)
+        answered = _asks.answered_by(rec, session=self.session, team=team.name)
         if answered is not None:
             team.open_asks.pop(answered, None)
         retracts = rec.get("retracts")
@@ -3680,7 +4646,14 @@ class Daemon:
         if not self._revalidate_asks_for_popup(team):
             return
         try:
-            self.api.request("plugin.pane.open", {"plugin_id": PLUGIN_ID, "entrypoint": "asks", "focus": True,
+            # The asks popup is a manifest entrypoint, and on Windows the
+            # manifest registers the platform-scoped id ('asks-windows'): the
+            # unix id answers 'platform_unsupported', which would leave the
+            # asks surface dead here (2026-10-21 port fix - found in the
+            # daemon log after the restart).
+            self.api.request("plugin.pane.open", {"plugin_id": PLUGIN_ID,
+                                                  "entrypoint": paths.entrypoint_id("asks"),
+                                                  "focus": True,
                                                   "env": {"HERDR_TEAM": team.name}}, timeout=5.0)
         except HerdrTeamError as err:
             # ``ui_busy`` means the operator (or another popup) has the slot.

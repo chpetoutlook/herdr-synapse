@@ -133,7 +133,10 @@ class StraightIsTodaysRoute(unittest.TestCase):
     def test_every_golden_arrow(self):
         count = 0
         for path in sorted((FIXTURES / "display" / "scenes").glob("*.json")):
-            scene = json.loads(path.read_text())
+            # The golden scenes are utf-8; read_text() with no encoding reads in
+            # the LOCALE encoding, which is cp1252 on Windows, and the byte
+            # 0x8d in them does not decode (2026-10-22 port fix, W-34).
+            scene = json.loads(path.read_text(encoding="utf-8"))
             by_id = {el["id"]: el for el in scene.get("elements") or []}
             for el in by_id.values():
                 if el.get("type") != "arrow" or len(el.get("points") or []) < 2 or (el.get("style") or {}).get("route"):

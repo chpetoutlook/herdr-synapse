@@ -25,8 +25,24 @@ from dataclasses import dataclass, field
 from typing import IO, Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from herdr_team import SKILL_VERSION, VERSION
-from herdr_team.errors import EXIT_OK, EXIT_USAGE, HerdrTeamError, UsageError, emit_error
+from herdr_team.errors import EXIT_OK, EXIT_UNREACHABLE, EXIT_USAGE, HerdrTeamError, UsageError, emit_error
 from herdr_team import paths as _paths
+
+
+def _transport_error(exc: OSError) -> HerdrTeamError:
+    """Name a transport failure instead of dumping a traceback.
+
+    A raw ``OSError`` from the transport used to escape the CLI as a Python
+    traceback, which tells the reader nothing about the condition: the
+    reviewer hit it on ``herdr-synapse board --new``. The condition is named
+    here: a pipe whose handle went invalid, or a server that cannot be
+    reached (2026-10-21 port fix, W-15).
+    """
+    text = "{}: {}".format(type(exc).__name__, exc)
+    lowered = text.lower()
+    if "handle is invalid" in lowered or "broken pipe" in lowered or "pipe is closed" in lowered:
+        return HerdrTeamError("pipe_handle_invalid", "the Herdr pipe handle is invalid: {}".format(exc), EXIT_UNREACHABLE)
+    return HerdrTeamError("herdr_unreachable", "Herdr is unreachable: {}".format(exc), EXIT_UNREACHABLE)
 
 PROG = "herdr-synapse"
 
@@ -174,9 +190,30 @@ def api_for(args: argparse.Namespace, layout: Optional[_paths.Layout] = None) ->
     return HerdrApi(resolved.socket, env=args.env)
 
 
+def _utf8_stream(out: IO[str]) -> IO[str]:
+    """Make ``out`` safe for the characters this CLI prints.
+
+    Windows consoles default to a legacy code page (cp1252 here), and the
+    roster renders glyphs a legacy code page cannot encode - the working-state
+    half-circle alone made ``herdr-synapse who`` die with a
+    ``UnicodeEncodeError`` instead of printing a roster (2026-10-21 port fix).
+    UTF-8 with a replacing error handler prints the character or a stand-in,
+    never a traceback.
+    """
+    reconfigure = getattr(out, "reconfigure", None)
+    if reconfigure is None:
+        return out
+    try:
+        reconfigure(encoding="utf-8", errors="replace")
+    except (ValueError, OSError, AttributeError):
+        pass
+    return out
+
+
 def emit(args: argparse.Namespace, payload: Dict[str, Any], human: Union[None, str, Callable[[], str]] = None) -> int:
     """Print ``payload`` as one JSON object in ``--json`` mode, else the human text."""
     out: IO[str] = getattr(args, "stdout", None) or sys.stdout
+    out = _utf8_stream(out)
     if getattr(args, "json", False):
         out.write(json.dumps(payload, ensure_ascii=False) + "\n")
     else:
@@ -201,6 +238,34 @@ def read_skill_text() -> str:
 # entry point
 
 
+def _require_python() -> None:
+    """Refuse an interpreter older than 3.9, in the CLI's own JSON shape.
+
+    The Windows launcher used to probe the version with a SECOND interpreter
+    (``py -3 --version``) before it started the CLI, and that fork cost 2.7 s
+    on this machine (measured 2026-10-21) - every CLI call paid it, so a call
+    took ~12 s where the CLI itself takes ~2 s. The gate now runs INSIDE the
+    interpreter the launcher starts: one process, one check, no second fork.
+
+    The refusal is the launcher's own, kept: one JSON object on stderr, the
+    code ``python_too_old``, exit 1 (2026-10-21 port fix, W-27).
+
+    The check is taken on Windows only. The POSIX launcher still gates itself
+    before python starts - it pays one fork and ``exec``s, so the probe is
+    cheap there - and a gate that fired on unix as well would change the unix
+    branch: the refusal would come from the CLI instead of from the launcher
+    that the caller sees.
+    """
+    if os.name != "nt" or sys.version_info >= (3, 9):
+        return
+    version = "Python {}.{}.{}".format(*sys.version_info[:3])
+    err = HerdrTeamError(
+        "python_too_old",
+        "herdr-synapse needs Python 3.9 or newer, found {} at {}; set HERDR_TEAM_PYTHON".format(version, sys.executable),
+    )
+    sys.exit(emit_error(err, sys.stderr))
+
+
 def main(
     argv: Optional[Sequence[str]] = None,
     env: Optional[Mapping[str, str]] = None,
@@ -209,6 +274,7 @@ def main(
     api: Any = None,
 ) -> int:
     """Parse, dispatch, and turn every ``HerdrTeamError`` into a JSON stderr line."""
+    _require_python()
     args_list = list(sys.argv[1:] if argv is None else argv)
     out = stdout if stdout is not None else sys.stdout
     err = stderr if stderr is not None else sys.stderr
@@ -250,6 +316,10 @@ def main(
         return 130
     except BrokenPipeError:
         return EXIT_OK
+    except OSError as exc:
+        # A transport failure that escaped the API layer: name the condition
+        # instead of dumping a Python traceback (2026-10-21 port fix, W-15).
+        return emit_error(_transport_error(exc), err)
 
 
 if __name__ == "__main__":

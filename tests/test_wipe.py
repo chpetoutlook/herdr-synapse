@@ -1,6 +1,8 @@
 """``wipe``: empty a board without renumbering it (0.15.1). Every test here fails against 0.15.0."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import os
 import unittest
 
@@ -25,7 +27,13 @@ class StoreTests(unittest.TestCase):
             post(self.ts, MEMBER, "post {}".format(i))
         result = self.board.clear("human", reason="fresh start")
         self.assertEqual((result["records"], result["first_seq"], result["last_seq"], result["note_seq"]), (5, 1, 5, 6))
-        self.assertTrue(result["archived_to"].endswith("archive/board.1-5.jsonl"))
+        # The archived path is a FILESYSTEM path, so it is in this platform's shape:
+        # a test that asserts "archive/board.1-5.jsonl" verbatim asserts a POSIX
+        # shape.  The NOTE below is the other thing - the product's own portable
+        # reference inside a message - and it stays exactly as it is, because a
+        # user reads it and it must not change shape with the host.
+        self.assertTrue(result["archived_to"].endswith(
+            str(Path("archive") / "board.1-5.jsonl")))
         active = self.board.read()
         self.assertEqual([r["seq"] for r in active], [6])
         note = active[0]

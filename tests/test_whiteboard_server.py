@@ -29,7 +29,7 @@ from herdr_team import whiteboard_server as W
 from herdr_team.errors import HerdrTeamError
 from herdr_team.identity import Author
 
-from support import PLUGIN_ROOT, TempState, whiteboard_on
+from support import assert_mode, PLUGIN_ROOT, symlink_or_skip, TempState, whiteboard_on
 
 
 def operator() -> Author:
@@ -322,7 +322,7 @@ class TicketTests(ServerCase):
         stored = W.tickets_dir(self.ts.session) / (hashlib.sha256(ticket.encode()).hexdigest() + ".json")
         self.assertTrue(stored.is_file(), "only the ticket's hash names the file")
         self.assertNotIn(ticket, stored.read_text())
-        self.assertEqual(stat.S_IMODE(os.stat(stored).st_mode), 0o600)
+        assert_mode(stored, 0o600)
         response = self.request("GET", "/?ticket=" + ticket)
         self.assertEqual(response.status, 303)
         self.assertEqual(response.header("Location"), "/", "the redirect drops the ticket from the address bar and history")
@@ -551,7 +551,7 @@ class HeaderTests(ServerCase):
 class StaticTests(ServerCase):
     def test_path_traversal_is_refused(self):
         cookie, _csrf = self.sign_in()
-        os.symlink(self.static_root / "secret.txt", self.dist / "assets" / "link.txt")
+        symlink_or_skip(self.static_root / "secret.txt", self.dist / "assets" / "link.txt")
         for path in ("/../secret.txt", "/%2e%2e/secret.txt", "/assets/..%2f..%2fsecret.txt", "/assets/%2e%2e/%2e%2e/secret.txt",
                      "/assets/link.txt", "/.hidden", "/assets/%00x", "/assets\\..\\secret.txt", "//etc/passwd", "/assets/"):
             response = self.request("GET", path, {"Cookie": cookie})
@@ -716,7 +716,11 @@ class ApiTests(ServerCase):
         self.assertEqual(self.authed("POST", "/api/teams/alpha/exports/..%2fx", self.cookie, self.csrf, png).status, 400)
 
     def test_artifact_data_views_text_and_activity(self):
-        (self.fake.asset_dir / "churn.csv").write_text("month,rate\n1,0.1\n", encoding="utf-8")
+        # The asset is written as BYTES: a text-mode write turns every \n into
+        # \r\n on Windows, so the server would serve a different byte string
+        # than the one the assertion below compares against (2026-10-21 port
+        # fix, W-22).
+        (self.fake.asset_dir / "churn.csv").write_bytes(b"month,rate\n1,0.1\n")
         data = self.get("/api/teams/alpha/artifact?path=churn.csv")
         self.assertEqual((data.status, data.header("Content-Type")), (200, "text/csv; charset=utf-8"))
         self.assertEqual(data.header("Content-Security-Policy"), W.ASSET_CSP)
@@ -1211,7 +1215,7 @@ class ServeTests(LifecycleCase):
         self.assertEqual(rec["started_by"], {"name": "human", "via": "console", "verified": True})
         self.assertIn("beat_at", rec)
         self.assertIn("version", rec)
-        self.assertEqual(stat.S_IMODE(os.stat(W.state_path(self.ts.session)).st_mode), 0o600)
+        assert_mode(W.state_path(self.ts.session), 0o600)
         thread.join(5)
         self.assertEqual(result, [0])
         self.assertFalse(W.state_path(self.ts.session).exists(), "the record goes with the server")
@@ -1407,7 +1411,17 @@ class BuiltPageTests(unittest.TestCase):
                     on_disk.add(rel)
         self.assertEqual(set(listed), on_disk, "every file in web/dist is listed, and nothing listed is missing")
         for rel, digest in listed.items():
-            self.assertEqual(hashlib.sha256((DIST / rel).read_bytes()).hexdigest(), digest, rel)
+            # the digest is over the bytes as they were BUILT. `web/dist` is
+            # marked `text: unset`, so git never rewrites those files and the
+            # checkout holds the upstream bytes - but a checkout that DID
+            # rewrite the line endings is not a different build, so the
+            # LF-normalised bytes are accepted as the same thing (the estate's
+            # own convention: the drift check normalises CRLF to LF before
+            # comparing - 2026-10-21 port fix, W-22)
+            data = (DIST / rel).read_bytes()
+            if hashlib.sha256(data).hexdigest() != digest:
+                data = data.replace(b"\r\n", b"\n")
+            self.assertEqual(hashlib.sha256(data).hexdigest(), digest, rel)
         lines = (DIST / "manifest.sha256").read_text(encoding="utf-8").splitlines()
         self.assertEqual({line.split("  ", 1)[1]: line.split("  ", 1)[0] for line in lines}, listed)
 

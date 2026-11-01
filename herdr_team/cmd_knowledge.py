@@ -1277,7 +1277,7 @@ COMMANDS = [
     Command(
         name="knowledge",
         help="the team's rules and findings",
-        description="Rules are the operator's DOs and DON'Ts (human only). Findings are attributed peer notes any member may add. "
+        description="Rules are the operator's DOs and DON'Ts (the operator, or a delegate of this team). Findings are attributed peer notes any member may add. "
                     "knowledge import --from <team|folder> adopts a previous team's rules, facts and canvas into this team (the operator).",
         add_arguments=_add_knowledge_arguments,
         run=_run_knowledge,
@@ -1392,8 +1392,9 @@ def _run_pane(args: argparse.Namespace) -> int:
 
     env = dict(args.env)
     layout = layout_for(args)
-    if env.get("HERDR_PLUGIN_ENTRYPOINT_ID") != ENTRYPOINT and not getattr(args, "force", False):
+    if not _paths.entrypoint_matches(env, ENTRYPOINT) and not getattr(args, "force", False):
         raise HerdrTeamError("not_a_plugin_pane", "knowledge-pane runs in the knowledge popup; use `herdr-synapse ui knowledge`, `herdr-synapse knowledge-status`, or pass --force", 1)
+    _p.require_vendor_curses(env)
     if not _p.socket_allowed(layout.config_dir, layout.socket):
         sys.stderr.write("herdr-synapse knowledge-pane skipped: socket not allowed\n")
         return EXIT_OK

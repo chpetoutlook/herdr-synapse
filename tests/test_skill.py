@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from herdr_team import SKILL_VERSION, VERSION, cli, cmd_skill, paths
+from support import symlink_or_skip, symlink_privilege
 
 SKILL = paths.skill_file()
 
@@ -177,7 +178,21 @@ class SkillInstallCase(unittest.TestCase):
 
 
 class SkillInstallTests(SkillInstallCase):
+    def require_symlinks(self) -> None:
+        """The PRODUCT creates the symlinks for some agents.
+
+        A Windows machine without the symlink privilege cannot: the install
+        then reports the symlink as skipped, with the reason, and the install
+        as not ok - which is the product's answer and not a defect. The test
+        skips rather than assert a shape that belongs to the machine's
+        capability (2026-10-21 port fix, W-22).
+        """
+        available, reason = symlink_privilege()
+        if not available:
+            self.skipTest("this machine cannot create symlinks: {}".format(reason))
+
     def test_layout_matches_npx_skills(self):
+        self.require_symlinks()
         self.agent_dirs(".claude", ".codex/skills/.system/builtin", ".gemini")
         (self.path(".codex/skills/.system/builtin") / "SKILL.md").write_text("system skill\n", encoding="utf-8")
         code, payload, _ = self.skill("install")
@@ -219,6 +234,7 @@ class SkillInstallTests(SkillInstallCase):
         self.assertTrue(all(e["state"] == "current" for e in payload["installed"]))
 
     def test_check_before_install_and_after_a_stale_copy(self):
+        self.require_symlinks()
         self.agent_dirs(".claude", ".codex")
         code, payload, _ = self.skill("check")
         self.assertEqual(code, 0)
@@ -278,7 +294,7 @@ class SkillInstallTests(SkillInstallCase):
         (elsewhere / "SKILL.md").write_text("other\n", encoding="utf-8")
         link = self.path(".codex", "skills", "herdr-synapse")
         link.parent.mkdir(parents=True)
-        os.symlink(os.fspath(elsewhere), os.fspath(link))
+        symlink_or_skip(os.fspath(elsewhere), os.fspath(link))
         code, payload, _ = self.skill("install")
         self.assertFalse(payload["ok"])
         self.assertIn({"path": os.fspath(link), "reason": "foreign_symlink"}, payload["skipped"])
@@ -295,13 +311,14 @@ class SkillInstallTests(SkillInstallCase):
         (elsewhere / "SKILL.md").write_text(self.source, encoding="utf-8")
         canonical = self.path(".agents", "skills", "herdr-synapse")
         canonical.parent.mkdir(parents=True)
-        os.symlink(os.fspath(elsewhere), os.fspath(canonical))
+        symlink_or_skip(os.fspath(elsewhere), os.fspath(canonical))
         code, payload, _ = self.skill("install")
         self.assertFalse(payload["ok"])
         self.assertIn({"path": os.fspath(canonical), "reason": "foreign_symlink"}, payload["skipped"])
         self.assertTrue(canonical.is_symlink())
 
     def test_old_copy_where_a_symlink_belongs_is_reported_stale(self):
+        self.require_symlinks()
         self.agent_dirs(".gemini")
         old = self.path(".gemini", "skills", "herdr-synapse")
         old.mkdir(parents=True)

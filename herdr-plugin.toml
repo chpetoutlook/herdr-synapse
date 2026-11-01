@@ -3,88 +3,224 @@ name = "Herdr Synapse"
 version = "0.23.0"
 min_herdr_version = "0.8.2"
 description = "Teams of agents in one Herdr session: roster, charter, shared board, idle-gated nudges"
-platforms = ["macos", "linux"]
+# +windows: the local Windows port (2026-10-20). Every entrypoint has a Windows
+# twin that resolves the plugin root first (the command's cwd is not reliable on
+# Windows), and the unix commands are kept verbatim with platforms = ["macos",
+# "linux"]. The untouched unix manifest is in herdr-plugin.toml.orig.
+platforms = ["macos", "linux", "windows"]
+
+# The Windows root resolution used by every entrypoint below: HERDR_PLUGIN_ROOT
+# when Herdr set it, else the plugin_root of this plugin id from
+# `herdr plugin list --json`, with the Windows `\\?\` prefix stripped.
+# win-root = $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)};
+# win-run  = & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd')
 
 [[startup]]
 command = ["./bin/herdr-synapse", "daemon", "start"]
+platforms = ["macos", "linux"]
+
+[[startup]]
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'daemon' 'start' ''']
+platforms = ["windows"]
 
 [[actions]]
 id = "team-up"
 title = "Teams: manage agents and teams"
 contexts = ["global"]
 command = ["./bin/herdr-synapse", "ui", "picker"]
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "team-up-windows"
+title = "Teams: manage agents and teams"
+contexts = ["global"]
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'ui' 'picker' ''']
+platforms = ["windows"]
 
 [[actions]]
 id = "compose"
 title = "Post to the team board"
 contexts = ["pane"]
 command = ["./bin/herdr-synapse", "ui", "compose"]
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "compose-windows"
+title = "Post to the team board"
+contexts = ["pane"]
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'ui' 'compose' ''']
+platforms = ["windows"]
 
 [[actions]]
 id = "console"
 title = "Open the team console"
 contexts = ["global"]
 command = ["./bin/herdr-synapse", "ui", "console"]
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "console-windows"
+title = "Open the team console"
+contexts = ["global"]
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'ui' 'console' ''']
+platforms = ["windows"]
 
 [[actions]]
 id = "who"
 title = "Who is on the team"
 contexts = ["global"]
 command = ["./bin/herdr-synapse", "ui", "who"]
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "who-windows"
+title = "Who is on the team"
+contexts = ["global"]
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'ui' 'who' ''']
+platforms = ["windows"]
 
 [[actions]]
 id = "usage"
 title = "Usage limits across agents"
 contexts = ["global"]
 command = ["./bin/herdr-synapse", "ui", "usage"]
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "usage-windows"
+title = "Usage limits across agents"
+contexts = ["global"]
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'ui' 'usage' ''']
+platforms = ["windows"]
 
 [[actions]]
 id = "knowledge"
 title = "Team knowledge bases"
 contexts = ["global"]
 command = ["./bin/herdr-synapse", "ui", "knowledge"]
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "knowledge-windows"
+title = "Team knowledge bases"
+contexts = ["global"]
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'ui' 'knowledge' ''']
+platforms = ["windows"]
 
 [[actions]]
 id = "mission"
 title = "Mission control: what needs you across teams"
 contexts = ["global"]
 command = ["./bin/herdr-synapse", "ui", "mission"]
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "mission-windows"
+title = "Mission control: what needs you across teams"
+contexts = ["global"]
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'ui' 'mission' ''']
+platforms = ["windows"]
 
 [[actions]]
 id = "whiteboard"
 title = "Open the team whiteboard"
 contexts = ["global"]
 command = ["./bin/herdr-synapse", "whiteboard", "open"]
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "whiteboard-windows"
+title = "Open the team whiteboard"
+contexts = ["global"]
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'whiteboard' 'open' ''']
+platforms = ["windows"]
 
 [[actions]]
 id = "toggle-view"
 title = "Toggle the team Agents view"
 contexts = ["global"]
 command = ["./bin/herdr-synapse", "view", "toggle"]
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "toggle-view-windows"
+title = "Toggle the team Agents view"
+contexts = ["global"]
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'view' 'toggle' ''']
+platforms = ["windows"]
 
 [[actions]]
 id = "daemon-start"
 title = "Start the team notifier"
 contexts = ["global"]
 command = ["./bin/herdr-synapse", "daemon", "start"]
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "daemon-start-windows"
+title = "Start the team notifier"
+contexts = ["global"]
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'daemon' 'start' ''']
+platforms = ["windows"]
 
 [[events]]
 on = "pane.agent_detected"
 command = ["./bin/hook", "agent_detected"]
+platforms = ["macos", "linux"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'hook.ps1') 'agent_detected' ''']
+platforms = ["windows"]
 
 [[events]]
 on = "pane.closed"
 command = ["./bin/hook", "pane_closed"]
+platforms = ["macos", "linux"]
+
+[[events]]
+on = "pane.closed"
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'hook.ps1') 'pane_closed' ''']
+platforms = ["windows"]
 
 [[events]]
 on = "pane.exited"
 command = ["./bin/hook", "pane_exited"]
+platforms = ["macos", "linux"]
+
+[[events]]
+on = "pane.exited"
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'hook.ps1') 'pane_exited' ''']
+platforms = ["windows"]
 
 [[panes]]
 id = "console"
 title = "Team console"
 placement = "split"
 command = ["sh", "console.sh"]
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "console-windows"
+title = "Team console"
+placement = "split"
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path $p 'console.cmd') ''']
+platforms = ["windows"]
 
 [[panes]]
 id = "compose"
@@ -93,6 +229,17 @@ placement = "popup"
 width = "80%"
 height = 12
 command = ["./bin/herdr-synapse", "compose"]
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "compose-windows"
+title = "Post"
+placement = "popup"
+width = "80%"
+height = 12
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'compose' ''']
+platforms = ["windows"]
 
 [[panes]]
 id = "picker"
@@ -101,6 +248,17 @@ placement = "popup"
 width = "80%"
 height = 28
 command = ["./bin/herdr-synapse", "picker"]
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "picker-windows"
+title = "Teams"
+placement = "popup"
+width = "80%"
+height = 28
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'picker' ''']
+platforms = ["windows"]
 
 [[panes]]
 id = "asks"
@@ -109,6 +267,17 @@ placement = "popup"
 width = "80%"
 height = 20
 command = ["./bin/herdr-synapse", "asks-pane"]
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "asks-windows"
+title = "Waiting on you"
+placement = "popup"
+width = "80%"
+height = 20
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'asks-pane' ''']
+platforms = ["windows"]
 
 [[panes]]
 id = "usage"
@@ -117,6 +286,17 @@ placement = "popup"
 width = "90%"
 height = 28
 command = ["./bin/herdr-synapse", "usage-pane"]
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "usage-windows"
+title = "Usage limits"
+placement = "popup"
+width = "90%"
+height = 28
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'usage-pane' ''']
+platforms = ["windows"]
 
 [[panes]]
 id = "knowledge"
@@ -125,6 +305,17 @@ placement = "popup"
 width = "90%"
 height = 28
 command = ["./bin/herdr-synapse", "knowledge-pane"]
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "knowledge-windows"
+title = "Team knowledge"
+placement = "popup"
+width = "90%"
+height = 28
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'knowledge-pane' ''']
+platforms = ["windows"]
 
 [[panes]]
 id = "mission"
@@ -133,6 +324,17 @@ placement = "popup"
 width = "90%"
 height = 30
 command = ["./bin/herdr-synapse", "mission-pane"]
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "mission-windows"
+title = "Mission control"
+placement = "popup"
+width = "90%"
+height = 30
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'mission-pane' ''']
+platforms = ["windows"]
 
 [[panes]]
 id = "whiteboard"
@@ -141,3 +343,14 @@ placement = "popup"
 width = "80%"
 height = 12
 command = ["./bin/herdr-synapse", "whiteboard", "open", "--popup"]
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "whiteboard-windows"
+title = "Whiteboard"
+placement = "popup"
+width = "80%"
+height = 12
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('\\?\')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p 'bin') 'herdr-synapse.cmd') 'whiteboard' 'open' '--popup' ''']
+platforms = ["windows"]

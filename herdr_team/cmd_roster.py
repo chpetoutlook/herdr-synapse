@@ -40,9 +40,11 @@ from herdr_team import identity as _identity
 from herdr_team import instructions_doc as _instructions_doc
 from herdr_team import operator as _operator
 from herdr_team import paths as _paths
+from herdr_team import platform_compat as _compat
 from herdr_team import render as _render
 from herdr_team import roster as _roster
 from herdr_team import store
+from herdr_team import superuser_designations as _superuser_designations
 from herdr_team import workdir as _workdir
 from herdr_team.cli import api_for, emit, layout_for
 from herdr_team.cmd_board import (
@@ -114,6 +116,9 @@ def _human_only(layout: Layout, team: Optional[str], author: Author, action: str
         return
     if getattr(author, "operator", False):
         audit(layout, team, "operator_action", author, {"action": action, "resolved": author.name, "via": author.via})
+        return
+    if getattr(author, "superuser", False):
+        audit(layout, team, "superuser_action", author, {"action": action, "resolved": author.name, "via": author.via})
         return
     audit(layout, team, "author_mismatch", author, {"action": action, "resolved": author.name, "via": author.via})
     raise HerdrTeamError("author_mismatch", _identity.authority_refusal(action, author), EXIT_REFUSED, {"action": action, "author": author.name, "via": author.via})
@@ -666,9 +671,9 @@ def _add_create_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--expect-terminal", action="append", default=[], metavar="NAME=ID", help="refuse a live member whose terminal differs from this creation selection")
     parser.add_argument("--brief", action="append", default=[], metavar="NAME=TEXT", help="required Mission for a new member, keyed by final name or role; repeat for every member")
     parser.add_argument("--project", metavar="PATH", help="the team's project directory; creates <path>/.herdr-synapse/<team>/")
-    parser.add_argument("--rules", metavar="TEXT", help="the team's DOs and DON'Ts (human only)")
-    parser.add_argument("--rules-file", dest="rules_file", metavar="PATH", help="read the rules from a file (human only)")
-    parser.add_argument("--instructions", action="append", default=[], metavar="NAME=TEXT", help="long-form instructions for one member; a non-empty Mission can supply its required brief (human only)")
+    parser.add_argument("--rules", metavar="TEXT", help="the team's DOs and DON'Ts (human or a delegate of this team)")
+    parser.add_argument("--rules-file", dest="rules_file", metavar="PATH", help="read the rules from a file (human or a delegate of this team)")
+    parser.add_argument("--instructions", action="append", default=[], metavar="NAME=TEXT", help="long-form instructions for one member; a non-empty Mission can supply its required brief (human or a delegate of this team)")
     parser.add_argument("--from-workspace", dest="from_workspace", metavar="ID")
     parser.add_argument("--names", choices=("prefixed", "plain"), default="prefixed")
     parser.add_argument("--rename", action="store_true", help="rename targets that already carry a name")
@@ -1495,14 +1500,43 @@ def _run_resume(args: argparse.Namespace) -> int:
 
 def _add_operator_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("action", nargs="?", choices=("list", "grant", "revoke"), help="list (default), grant, or revoke")
-    parser.add_argument("member", nargs="?", help="the member to delegate to")
+    parser.add_argument("member", nargs="?", help="the member to delegate to (omit with --all)")
+    parser.add_argument("--all", action="store_true", help="grant to all agent members of the team")
     parser.add_argument("--ttl", metavar="DURATION", help="how long the grant lasts (default 12h; 0 never expires)")
     parser.add_argument("--note", metavar="TEXT", help="why, for the audit trail and the board")
 
 
-def _strictly_human(layout: Layout, team: str, author: Author, action: str) -> None:
-    """Granting authority is the operator's alone; a delegate cannot pass its own on."""
+def _strictly_human(layout: Layout, team: str, author: Author, action: str, scope: str = "team") -> None:
+    """Granting authority is the operator's alone; a delegate cannot pass its own on.
+
+    A SUPERUSER (the W-16 designated pane/session, or the sweep-allowed
+    superuser executable) may pass authority on: the W-16 gate exemptions
+    (§5) list charter, manager, dissolve and remove among the gates a
+    designated superuser passes, and a superuser designation is itself
+    operator-created. An operator DELEGATE may NOT: passing its own
+    delegation on is exactly what this gate exists to refuse
+    (``test_a_delegate_cannot_pass_its_authority_on``).
+
+    One bounded exception, and it is scoped: ``scope="team"`` lets a delegate
+    hand the operator's authority to a seat in its OWN team. The team is meant
+    to run without the operator in the loop, and a delegate that cannot appoint
+    a manager, or empower a seat to rule, is a delegate that still needs the
+    operator. The grant records who passed it on (``granted_by``) and every
+    use is audited, so the chain stays visible. ``scope="session"`` -- naming a
+    superuser pane, which reaches outside the team -- stays the operator's.
+    """
     if author.trusted_human:
+        return
+    if scope == "team" and _identity.is_operator_delegate(author, team):
+        # The operator's hands inside their own team: they may hand that
+        # authority to a seat in the same team, so the team keeps running
+        # without the operator in the loop. The grant records who passed it on
+        # (``granted_by``) and every use is audited.
+        audit(layout, team, "operator_action", author,
+              {"action": action, "resolved": author.name, "via": author.via, "delegated": True})
+        return
+    if getattr(author, "superuser", False):
+        audit(layout, team, "superuser_action", author, {"action": action, "resolved": author.name, "via": author.via})
         return
     audit(layout, team, "author_mismatch", author, {"action": action, "resolved": author.name, "via": author.via})
     raise HerdrTeamError(
@@ -1511,6 +1545,171 @@ def _strictly_human(layout: Layout, team: str, author: Author, action: str) -> N
         EXIT_REFUSED,
         {"action": action, "author": author.name, "via": author.via},
     )
+
+
+def _grant_to_one(doc: Any, member: Any, layout: Any, team_name: str, author: Any, args: Any, ttl_s: int) -> int:
+    """Grant operator authority to a single member."""
+    ttl_s = _operator.DEFAULT_TTL_S if getattr(args, 'ttl', None) is None else _cmd_misc_duration(args.ttl)
+    entry = _operator.grant(layout.session, team_name, member.name, ttl_s=ttl_s, note=args.note, granted_by=author.name)
+    _roster.append_system_record(
+        layout.team(team_name), "operator_granted",
+        "{} may now write the charter, the team rules and any member's instructions{}".format(
+            member.name, " until {}".format(entry["expires_at"]) if entry.get("expires_at") else " (no expiry)"),
+        to=["all"], extra={"member": member.name, "expires_at": entry.get("expires_at")}, socket=os.fspath(layout.socket))
+    audit(layout, team_name, "operator_grant", author, {"member": member.name, "expires_at": entry.get("expires_at"), "note": getattr(args, 'note', None)})
+    return emit(args, dict(entry, team=team_name), lambda: "{} now acts with your authority{}".format(
+        member.name, " until {}".format(entry["expires_at"]) if entry.get("expires_at") else "; it does not expire"))
+
+
+def _grant_to_all(doc: Any, members: List[Any], layout: Any, team_name: str, author: Any, args: Any, ttl_s: int) -> int:
+    """Grant operator authority to all agent members of the team."""
+    ttl_s = _operator.DEFAULT_TTL_S if getattr(args, 'ttl', None) is None else _cmd_misc_duration(args.ttl)
+    granted = []
+    for member in members:
+        entry = _operator.grant(layout.session, team_name, member.name, ttl_s=ttl_s, note=args.note, granted_by=author.name)
+        granted.append({"member": member.name, "expires_at": entry.get("expires_at")})
+        _roster.append_system_record(
+            layout.team(team_name), "operator_granted",
+            "{} may now write the charter, the team rules and any member's instructions{}".format(
+                member.name, " until {}".format(entry["expires_at"]) if entry.get("expires_at") else " (no expiry)"),
+            to=["all"], extra={"member": member.name, "expires_at": entry.get("expires_at")}, socket=os.fspath(layout.socket))
+        audit(layout, team_name, "operator_grant", author, {"member": member.name, "expires_at": entry.get("expires_at"), "note": getattr(args, 'note', None)})
+
+    _roster.append_system_record(
+        layout.team(team_name), "operator_granted",
+        "Operator authority granted to {} members: {}".format(len(granted), ", ".join(g["member"] for g in granted)),
+        to=["all"], extra={"members": granted}, socket=os.fspath(layout.socket))
+
+    payload = {"team": team_name, "granted": granted, "count": len(granted)}
+    def human() -> str:
+        return "Operator authority granted to {} members: {}".format(len(granted), ", ".join(g["member"] for g in granted))
+    return emit(args, payload, human)
+
+
+def _add_superuser_arguments(parser: argparse.ArgumentParser) -> None:
+    """Superuser subcommand arguments: show / designate / revoke / list."""
+    sub = parser.add_subparsers(dest="action", required=False)
+
+    p_list = sub.add_parser("list", help="list designated superuser panes/sessions")
+    p_list.set_defaults(action = "list")
+
+    p_designate = sub.add_parser("designate", help="designate a pane/session as superuser")
+    p_designate.add_argument("--pane", required=True, help="pane id, e.g. wF:pJ")
+    p_designate.add_argument("--session", required=False, default=None, help="session id to bind to the pane (optional; defaults to the pane's own)")
+    p_designate.add_argument("--global", dest="global_designation", action="store_true", help="write to session root (single global superuser across all teams) instead of per-team")
+    p_designate.set_defaults(action = "designate")
+
+    p_revoke = sub.add_parser("revoke", help="revoke a superuser designation")
+    p_revoke.add_argument("--pane", required=True, help="pane id to revoke")
+    p_revoke.set_defaults(action = "revoke")
+
+
+def _run_superuser(args: argparse.Namespace) -> int:
+    """Show / designate / revoke superuser designations per team.
+
+    The authoritative store is the W-16 registry at
+    ``<session>/superuser_designations.json`` (``DesignationRegistry``), which
+    ``identity._tier_outside`` reads to grant a designated pane/session
+    operator authority. The per-team ``superuser-designation.json`` file is a
+    SECONDARY mirror kept for the daemon's ask-reroute (it names a pane, and
+    the daemon resolves that pane to a roster member).
+    """
+    layout = layout_for(args)
+    api = api_for(args, layout)
+    team_name = _team_arg(args, layout, None)
+    author = _author(args, layout, api, team=team_name, require_server=False)
+    action = args.action or "list"
+
+    team = layout.team(team_name)
+
+    registry = _superuser_designations.DesignationRegistry(layout.session)
+
+    if action == "list":
+        entries = registry.list_designations()
+        mirror = _read_designation_mirror(layout, team_name)
+        return emit(args, {"team": team_name, "designations": entries, "mirror": mirror},
+                    lambda: _render_designations(entries))
+
+    # Designate or revoke require operator authority. A per-team designation is
+    # the team's own business, so the team's delegate may make it; a global one
+    # names a pane with authority across the session, and that stays the
+    # operator's.
+    _strictly_human(layout, team_name, author, "superuser {}".format(action),
+                    scope="session" if getattr(args, "global_designation", False) else "team")
+    check_write_session(args, layout, team_name)
+
+    # The mirror path the daemon reads for ask-reroute: per-team, or the
+    # session root for a global designation.
+    if getattr(args, "global_designation", False):
+        mirror_path = layout.session.root / "superuser-designation.json"
+    else:
+        mirror_path = layout.team(team_name).root / "superuser-designation.json"
+    mirror_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if action == "designate":
+        session_id = args.session or args.pane
+        registry.designate(
+            pane_id=args.pane,
+            session_id=session_id,
+            team=author.name,
+            source="cli superuser designate",
+        )
+        designation = {
+            "pane": args.pane,
+            "session": session_id,
+            "designated_by": author.name,
+            "designated_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        mirror_path.write_text(json.dumps(designation, indent=2), encoding="utf-8")
+        scope = "Global superuser" if getattr(args, "global_designation", False) else "Pane"
+        _roster.append_system_record(
+            layout.team(team_name), "superuser_designated",
+            "{} {} designated superuser (session {}) by {}".format(scope, args.pane, session_id, author.name),
+            to=["all"], extra={"pane": args.pane, "session": session_id}, socket=os.fspath(layout.socket))
+        audit(layout, team_name, "superuser_designate", author, {"pane": args.pane, "session": session_id})
+        return emit(args, {"designated": True, "pane": args.pane, "session": session_id}, lambda: "designated {}".format(args.pane))
+
+    if action == "revoke":
+        revoked = registry.revoke(pane_id=args.pane)
+        if mirror_path.exists():
+            mirror_path.unlink()
+        _roster.append_system_record(
+            layout.team(team_name), "superuser_designated",
+            "Pane {} revoked superuser by {}".format(args.pane, author.name),
+            to=["all"], extra={"pane": args.pane}, socket=os.fspath(layout.socket))
+        audit(layout, team_name, "superuser_revoke", author, {"pane": args.pane, "revoked": revoked})
+        return emit(args, {"designated": False, "pane": args.pane, "revoked": revoked}, lambda: "revoked {}".format(args.pane))
+
+    raise UsageError("unknown superuser action: {}".format(action))
+
+
+def _render_designations(entries: List[Dict[str, Any]]) -> str:
+    """Human table for ``superuser list`` (W-16 §7)."""
+    if not entries:
+        return "no active superuser designations"
+    lines = ["{:<12} {:<28} {:<16} {}".format("PANE", "SESSION", "DESIGNATED BY", "DESIGNATED AT")]
+    for entry in entries:
+        lines.append("{:<12} {:<28} {:<16} {}".format(
+            str(entry.get("pane_id") or "-"),
+            str(entry.get("session_id") or "-"),
+            str(entry.get("designated_by") or "-"),
+            str(entry.get("designated_at") or "-"),
+        ))
+    return "\n".join(lines)
+
+
+def _read_designation_mirror(layout: Layout, team_name: str) -> Optional[Dict[str, Any]]:
+    """The daemon-side mirror file, if one is present (ask-reroute source)."""
+    for path in (layout.session.root / "superuser-designation.json",
+                 layout.team(team_name).root / "superuser-designation.json"):
+        try:
+            if path.is_file():
+                doc = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(doc, dict):
+                    return dict(doc, path=os.fspath(path))
+        except (json.JSONDecodeError, OSError):
+            continue
+    return None
 
 
 def _run_operator(args: argparse.Namespace) -> int:
@@ -1531,17 +1730,22 @@ def _run_operator(args: argparse.Namespace) -> int:
         grants = _operator.active_all(layout.session)
         return emit(args, {"team": team_name, "grants": grants}, lambda: _render.render_operator_grants(grants))
 
-    _strictly_human(layout, team_name, author, "operator {}".format(action))
+    # A delegate may hand the operator's authority to a seat in its own team:
+    # the team runs without the operator in the loop.
+    _strictly_human(layout, team_name, author, "operator {}".format(action), scope="team")
     check_write_session(args, layout, team_name)
-    if not args.member:
-        raise UsageError("operator {} needs a member name".format(action))
     doc = _roster.load_team(layout.team(team_name))
-    member = doc.find(args.member)
-    if member is None or member.is_human or member.status == "left":
-        raise HerdrTeamError("member_not_found", "{!r} is not an agent member of team {!r}".format(args.member, team_name), EXIT_REFUSED,
-                             {"name": args.member, "team": team_name, "roster": doc.names()})
+    agent_members = [m for m in doc.members if m.kind != "human" and m.status != "left"]
 
     if action == "revoke":
+        if args.all:
+            raise UsageError("revoke --all is not supported; revoke one member at a time")
+        if not args.member:
+            raise UsageError("operator revoke needs a member name")
+        member = doc.find(args.member)
+        if member is None or member.is_human or member.status == "left":
+            raise HerdrTeamError("member_not_found", "{!r} is not an agent member of team {!r}".format(args.member, team_name), EXIT_REFUSED,
+                                 {"name": args.member, "team": team_name, "roster": doc.names()})
         dropped = _operator.revoke(layout.session, team_name, member.name)
         if dropped:
             _roster.append_system_record(
@@ -1553,15 +1757,20 @@ def _run_operator(args: argparse.Namespace) -> int:
                     "{} {}".format(member.name, "no longer holds a delegation" if dropped else "held no delegation"))
 
     ttl_s = _operator.DEFAULT_TTL_S if args.ttl is None else _cmd_misc_duration(args.ttl)
-    entry = _operator.grant(layout.session, team_name, member.name, ttl_s=ttl_s, note=args.note, granted_by=author.name)
-    _roster.append_system_record(
-        layout.team(team_name), "operator_granted",
-        "{} may now write the charter, the team rules and any member's instructions{}".format(
-            member.name, " until {}".format(entry["expires_at"]) if entry.get("expires_at") else " (no expiry)"),
-        to=["all"], extra={"member": member.name, "expires_at": entry.get("expires_at")}, socket=os.fspath(layout.socket))
-    audit(layout, team_name, "operator_grant", author, {"member": member.name, "expires_at": entry.get("expires_at"), "note": entry.get("note")})
-    return emit(args, dict(entry, team=team_name), lambda: "{} now acts with your authority{}".format(
-        member.name, " until {}".format(entry["expires_at"]) if entry.get("expires_at") else "; it does not expire"))
+
+    # Grant action (with optional --all)
+    if args.all:
+        if not agent_members:
+            raise UsageError("team has no agent members to grant to")
+        return _grant_to_all(doc, agent_members, layout, team_name, author, args, ttl_s)
+    else:
+        if not args.member:
+            raise UsageError("operator grant needs a member name or --all")
+        member = doc.find(args.member)
+        if member is None or member.is_human or member.status == "left":
+            raise HerdrTeamError("member_not_found", "{!r} is not an agent member of team {!r}".format(args.member, team_name), EXIT_REFUSED,
+                                 {"name": args.member, "team": team_name, "roster": doc.names()})
+        return _grant_to_one(doc, member, layout, team_name, author, args, ttl_s)
 
 
 #: Keep the announcement subordinate to the operator's canonical Mission, not a competing assignment.
@@ -1632,8 +1841,9 @@ def _run_manager(args: argparse.Namespace) -> int:
     check_write_session(args, layout, team_name)
     if args.operator:
         # Granting is the operator's alone even when appointing is not: a
-        # delegate may name a manager, but it may not hand its own authority on.
-        _strictly_human(layout, team_name, author, "manager --operator")
+        # delegate may name a manager, and it may hand that authority on
+        # inside its own team -- but not outside it.
+        _strictly_human(layout, team_name, author, "manager --operator", scope="team")
 
     changed = set_manager(layout, team_name, author, args.member or None)
     name = changed["member"]
@@ -2197,7 +2407,11 @@ def editor_command(env: Dict[str, str]) -> List[str]:
     """``$VISUAL`` or ``$EDITOR`` split like a shell would (``code --wait``), default ``vi``."""
     raw = env.get("VISUAL") or env.get("EDITOR") or "vi"
     try:
-        argv = shlex.split(raw)
+        # Split the way THIS platform splits a command line: POSIX rules on
+        # unix (unchanged), the C runtime's rules on Windows, where a
+        # backslash is an ordinary character and an editor path with spaces
+        # is the normal case (measured 2026-10-22).
+        argv = _compat.split_command_line(raw)
     except ValueError as err:
         raise HerdrTeamError("editor_failed", "cannot parse $EDITOR {!r}: {}".format(raw, err), EXIT_REFUSED, {"editor": raw})
     if not argv:
@@ -2338,7 +2552,8 @@ COMMANDS: List[Command] = [
     Command("bind", "re-attach a missing member to a live agent", _add_bind_arguments, _run_bind),
     Command("resume", "reopen a member's own harness session in this pane (human only)", _add_resume_arguments, _run_resume),
     Command("manager", "show, set, or clear the member that coordinates the team", _add_manager_arguments, _run_manager),
-    Command("operator", "show, grant, or revoke a member's delegation of your authority", _add_operator_arguments, _run_operator),
+    Command("operator", "show, grant, or revoke a member's delegation of your authority (a delegate holds it for its own team, and may hand it on inside that team)", _add_operator_arguments, _run_operator),
+    Command("superuser", "show, designate, or revoke a superuser pane/session (operator-authorized)", _add_superuser_arguments, _run_superuser),
     Command("dissolve", "archive a team and clear every member's tokens and labels", _add_dissolve_arguments, _run_dissolve),
     Command("use", "set the default team for human posts", _add_use_arguments, _run_use),
     Command("teams", "list the teams of this session (works offline)", _no_arguments, _run_teams),
@@ -2347,6 +2562,6 @@ COMMANDS: List[Command] = [
     Command("orient", "everything you need after losing your context: identity, charter, instructions, rules, teammates", _add_orient_arguments, _run_orient),
     Command("who", "the roster with live status (reads who.json)", _add_who_arguments, _run_who),
     Command("audit", "author-mismatch and other audited events", _add_audit_arguments, _run_audit),
-    Command("charter", "print, set, edit, or list the history of the team charter (human only to write)", _add_charter_arguments, _run_charter),
+    Command("charter", "print, set, edit, or list the history of the team charter (human or a delegate of this team writes it)", _add_charter_arguments, _run_charter),
     Command("brief", "set a member's role brief (--set) or enqueue its briefing", _add_brief_arguments, _run_brief),
 ]

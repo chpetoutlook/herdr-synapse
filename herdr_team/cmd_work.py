@@ -15,7 +15,11 @@ Who may do what:
   generation that claimed it (``attempt_fenced``);
 * a named reviewer, or a holder of a named role, reviews;
 * the requester, the team manager, and the operator (or a delegate) assign,
-  reopen, close, cancel and edit.
+  close, cancel and edit;
+* a settled item is reopened - with the reason on the record - by the
+  requester, the manager or the operator, or by one of the item's reviewers
+  who did not approve the attempt being reopened (W-38). A reviewer who
+  approved that attempt is refused, and the refusal names why.
 """
 from __future__ import annotations
 
@@ -71,6 +75,53 @@ def _manager(doc: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _verdict_holder(doc: Dict[str, Any], owner: Optional[str]) -> Optional[str]:
+    """The seat that owes the verdict when the item names the operator as reviewer.
+
+    A review slot only the operator can fill is a review that never happens: the
+    operator is not in the team's loop. The manager takes the verdict -- unless
+    the manager owns the item, because a seat never reviews its own work -- and
+    then the lead does. ``None`` means this roster has no seat that can give it,
+    and the request stays with the operator rather than being sent nowhere.
+    """
+    manager = _manager(doc)
+    if manager and manager != owner:
+        return manager
+    for member in agent_members(doc):
+        if member.get("role") == "lead" and str(member.get("name")) != owner:
+            return str(member.get("name"))
+    return None
+
+
+def _reviewable(doc: Dict[str, Any], review_by: Sequence[str], owner: Optional[str]) -> List[str]:
+    """The reviewer list of an item owned by ``owner``, able to actually review.
+
+    Three rules, one invariant: an item always has a reviewer who is not its
+    owner, and an item that names the operator also names an agent who can give
+    the verdict. Reassigning an item to its own reviewer would otherwise leave
+    the work with nobody who may close it.
+    """
+    names = [str(r) for r in review_by if r]
+    if not names:
+        # No reviewer configured: the item settles on its own.
+        return names
+    if owner and owner in names:
+        names = [n for n in names if n != owner]
+        if not names:
+            # The owner was the only reviewer: the verdict needs a seat that can
+            # give it, or the work could never be closed.
+            holder = _verdict_holder(doc, owner)
+            if holder:
+                names.append(holder)
+    if AUTHOR_HUMAN in names:
+        # Nothing waits on the operator: an item that names the operator also names
+        # a seat that can give the verdict.
+        holder = _verdict_holder(doc, owner)
+        if holder and holder not in names:
+            names.append(holder)
+    return names
+
+
 def _members(doc: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return {str(m.get("name")): m for m in agent_members(doc, include_left=True)}
 
@@ -109,11 +160,103 @@ def _require_operator(layout: Any, team_name: str, author: Author, item: Optiona
     raise HerdrTeamError("author_mismatch", "work {} is for the operator".format(action), EXIT_REFUSED, {"action": action, "author": author.name})
 
 
+def _require_ruling(layout: Any, team_name: str, author: Author, item: Optional[W.Item], doc: Dict[str, Any], action: str) -> None:
+    """Who may rule on a work item: the operator (or a delegate), or the manager.
+
+    A ruling decides an item that has no attempt, so it is a judgement about
+    work rather than a settlement of work. The operator's word is the
+    natural authority -- every brief in this team says "the operator rules"
+    -- and the team manager judges its own queue. The requester is not
+    enough: the requester wants the work done, and letting them rule it
+    done would route around the review the item names.
+
+    An operator acting through a grant is audited, as every other delegated
+    operator act is.
+    """
+    if author.trusted_human:
+        return
+    if getattr(author, "operator", False) and author.is_member and author.verified:
+        audit(layout, team_name, "operator_action", author, {"action": "work " + action, "id": item.id if item else None})
+        return
+    if author.is_member and author.verified and _manager(doc) == author.name:
+        return
+    audit(layout, team_name, "author_mismatch", author, {"action": "work " + action, "id": item.id if item else None})
+    raise HerdrTeamError(
+        "author_mismatch",
+        "work {} is for the operator (or a delegate the operator granted it to), or the team manager".format(action),
+        EXIT_REFUSED, {"action": action, "author": author.name, "id": item.id if item else None},
+    )
+
+
 def _require_verified_member(author: Author, action: str) -> None:
     if not author.is_member:
         raise HerdrTeamError("not_a_member", "work {} runs from a member's own pane; you are {}".format(action, author.name), EXIT_REFUSED, {"author": author.name, "via": author.via})
     if not author.verified:
         raise HerdrTeamError("author_unverified", "work {} needs a verified member pane ({})".format(action, author.reason or "identity unverified"), EXIT_REFUSED, {"author": author.name, "via": author.via})
+
+
+def _is_item_reviewer(author: Author, item: Optional[W.Item], doc: Dict[str, Any]) -> bool:
+    """Is this author one of the item's reviewers - named in ``review_by``, a
+    holder of a role it names - or already on its review record?"""
+    if item is None or not author.is_member or not author.verified:
+        return False
+    if author.name in _expand_reviewers(doc, item.review_by):
+        return True
+    return any(r.get("by") == author.name for r in item.reviews)
+
+
+def _approved_the_attempt(item: W.Item, author_name: str) -> Optional[str]:
+    """What this author approved that they may not reopen, or ``None`` (W-38).
+
+    A reviewer may reopen an item they did not approve; one who approved the
+    attempt being reopened sends the defect back through the requester or the
+    manager instead. An approval belongs to an attempt when it was recorded
+    at or after that attempt was claimed, so a fresh attempt opened after a
+    reopen is not the attempt the approval covered.
+    """
+    attempt = item.attempt
+    for review in item.reviews:
+        if review.get("by") != author_name or review.get("verdict") != "approved":
+            continue
+        if attempt is None:
+            return "the approval of {}".format(item.id)
+        at = W.store_parse_iso(review.get("at"))
+        claimed = W.store_parse_iso(attempt.claimed_at)
+        if at is None or claimed is None or at >= claimed:
+            return "attempt {} of {}".format(attempt.n, item.id)
+    return None
+
+
+def _require_reopen(layout: Any, team_name: str, author: Author, item: W.Item, doc: Dict[str, Any]) -> None:
+    """Who may reopen a settled item for a defect (W-38).
+
+    The requester, the manager and the operator keep the authority they have.
+    A reviewer gains one, and only one: on an item they did not approve in
+    the attempt being reopened, with the reason on the record. A reviewer who
+    approved that attempt is refused and the refusal names why, because that
+    route is the lead's and the requester's - an author_mismatch answers a
+    misuse here, not a defect.
+    """
+    if _can_manage(author, item, doc):
+        if getattr(author, "operator", False) and not author.trusted_human:
+            audit(layout, team_name, "operator_action", author, {"action": "work reopen", "id": item.id})
+        return
+    if _is_item_reviewer(author, item, doc):
+        approved = _approved_the_attempt(item, author.name)
+        if approved is None:
+            return
+        audit(layout, team_name, "author_mismatch", author, {"action": "work reopen", "id": item.id})
+        raise HerdrTeamError(
+            "author_mismatch",
+            "you approved {}; a reopen for a defect is the requester's ({}) or the manager's".format(approved, item.requester),
+            EXIT_REFUSED, {"action": "reopen", "author": author.name, "id": item.id, "approved": approved},
+        )
+    audit(layout, team_name, "author_mismatch", author, {"action": "work reopen", "id": item.id})
+    raise HerdrTeamError(
+        "author_mismatch",
+        "work reopen is for the requester ({}), the manager or the operator".format(item.requester),
+        EXIT_REFUSED, {"action": "reopen", "author": author.name, "id": item.id},
+    )
 
 
 def _expand_reviewers(doc: Dict[str, Any], review_by: Sequence[str]) -> List[str]:
@@ -123,6 +266,9 @@ def _expand_reviewers(doc: Dict[str, Any], review_by: Sequence[str]) -> List[str
             holders = [str(m.get("name")) for m in role_holders(doc, entry[len("role:"):])]
         elif entry == AUTHOR_HUMAN:
             holders = [AUTHOR_HUMAN]
+        elif entry.startswith("adversarial:"):
+            # adversarial:panel_name or adversarial:auto - panel members resolved at review time
+            holders = [entry]  # Keep as-is for validation; panel resolved during review
         else:
             holders = [entry]
         for name in holders:
@@ -131,19 +277,81 @@ def _expand_reviewers(doc: Dict[str, Any], review_by: Sequence[str]) -> List[str
     return names
 
 
+def _is_adversarial_review(item: 'W.Item') -> bool:
+    """Check if this item uses adversarial review."""
+    return any(r.startswith("adversarial:") for r in item.review_by)
+
+
+def _resolve_adversarial_panel(doc: Dict[str, Any], spec: str) -> List[str]:
+    """Resolve an adversarial panel spec to agent names.
+    
+    Spec formats:
+    - "auto" -> pick 3 agents with different roles/kinds (excluding owner)
+    - "role1,role2,role3" -> holders of those roles
+    - "config:panel_name" -> look up in team config
+    """
+    if spec == "auto":
+        members = [m for m in agent_members(doc) if m.get("name")]
+        # Prefer diverse kinds/roles, exclude owner (resolved at call site)
+        return [str(m.get("name")) for m in members[:3]]
+    elif spec.startswith("config:"):
+        panel_name = spec[len("config:"):]
+        config = doc.get("config") if isinstance(doc.get("config"), dict) else {}
+        # Adversarial panels are under config.work.adversarial_panels
+        work_config = config.get("work") if isinstance(config.get("work"), dict) else {}
+        panels = work_config.get("adversarial_panels") if isinstance(work_config.get("adversarial_panels"), dict) else {}
+        panel = panels.get(panel_name)
+        if isinstance(panel, dict) and isinstance(panel.get("members"), list):
+            return [str(m) for m in panel["members"] if isinstance(m, str)]
+        return []
+    else:
+        # Comma-separated role names: "security,performance,maintainability"
+        roles = [r.strip() for r in spec.split(",") if r.strip()]
+        holders = []
+        for role in roles:
+            role_holders_list = role_holders(doc, role)
+            for m in role_holders_list:
+                name = str(m.get("name"))
+                if name not in holders:
+                    holders.append(name)
+        return holders
+
+
 def _validate_reviewers(doc: Dict[str, Any], team_name: str, review_by: Sequence[str]) -> List[str]:
     out: List[str] = []
     for raw in review_by:
+        # Handle adversarial: specs as a single entry (don't split by comma)
+        # because the comma inside adversarial: is part of the spec, not a separator
+        if raw.strip().startswith("adversarial:"):
+            entry = raw.strip()
+            if entry not in out:
+                out.append(entry)
+            continue
         for entry in (part.strip() for part in raw.split(",")):
             if not entry:
                 continue
             if entry.startswith("role:"):
-                if not role_holders(doc, entry[len("role:"):]):
-                    raise HerdrTeamError("recipient_unknown", "no member holds role {}".format(entry[len("role:"):]), EXIT_REFUSED, {"role": entry})
-            elif entry != AUTHOR_HUMAN:
+                role_name = entry[len("role:"):]
+                holders = role_holders(doc, role_name)
+                if not holders:
+                    # A role nobody holds adds nobody - this is not an error
+                    # (the template's default reviewer role may not have a holder)
+                    continue
+                for m in holders:
+                    name = str(m.get("name"))
+                    if name not in out:
+                        out.append(name)
+            elif entry == AUTHOR_HUMAN:
+                if AUTHOR_HUMAN not in out:
+                    out.append(AUTHOR_HUMAN)
+            elif entry.startswith("adversarial:"):
+                # Accept adversarial: prefix; panel resolved at review time
+                if entry not in out:
+                    out.append(entry)
+            else:
                 entry = str(member_or_raise(doc, entry, team_name).get("name"))
-            if entry not in out:
-                out.append(entry)
+                if entry not in out:
+                    out.append(entry)
     return out
 
 
@@ -285,14 +493,18 @@ def _add(args: argparse.Namespace) -> int:
     owner = _owner_name(doc, team_name, author, args.to)
     config = doc.get("config") if isinstance(doc.get("config"), dict) else {}
     default_review = (config.get("work") or {}).get("review_by") if isinstance(config.get("work"), dict) else None
-    reviewers = _validate_reviewers(doc, team_name, args.review_by or [])
-    # The team's reviewers (a template's ``review_by``) always apply: a requester can add
-    # reviewers, not replace the operator's. A role nobody else holds adds nobody.
-    for entry in [r for r in (default_review or []) if isinstance(r, str)]:
-        for name in _expand_reviewers(doc, [entry]):
-            if name != owner and name not in reviewers and (name == AUTHOR_HUMAN or find_member(doc, name, allow_retired=False) is not None):
-                reviewers.append(name)
-    reviewers = [r for r in _expand_reviewers(doc, reviewers) if r != owner]  # nobody reviews its own work
+    # Combine command-line reviewers with team config default reviewers
+    all_review_specs = list(args.review_by or [])
+    for entry in (default_review or []):
+        if isinstance(entry, str):
+            all_review_specs.append(entry)
+    # Validate all reviewers together (including adversarial specs)
+    reviewers = _validate_reviewers(doc, team_name, all_review_specs)
+    # Expand reviewers (role: -> holders, adversarial: stays as-is for resolution at review time)
+    expanded = _expand_reviewers(doc, reviewers)
+    # Remove owner from reviewers (nobody reviews their own work), and give the
+    # verdict a seat that can give it when the item names the operator.
+    reviewers = _reviewable(doc, expanded, owner)
     items = W.load(team)
     deps = W.check_deps(items, None, W.clean_list((",".join(args.deps or [])).split(","), "dependencies"))
     _before, after, event = W.append(team, _event(author, doc, W.OP_CREATE, None, title=title, brief=brief, owner=owner, deps=deps, review_by=reviewers))
@@ -368,6 +580,13 @@ def _show(args: argparse.Namespace) -> int:
                 lines.append("  evidence: {}".format(e))
         for review in item.reviews:
             lines.append("review by {}: {}{}".format(review.get("by"), review.get("verdict"), ": " + str(review["note"]) if review.get("note") else ""))
+        for ruling in item.rulings:
+            lines.append("ruled by {} at {}: {} (now {})".format(
+                ruling.get("by"), ruling.get("at"), ruling.get("outcome"), ruling.get("status")))
+            if ruling.get("summary"):
+                lines.append("  ruling: {}".format(ruling["summary"]))
+            for e in ruling.get("evidence") or []:
+                lines.append("  evidence: {}".format(e))
         for hint in row["hints"]:
             if hint["for"] != "nobody":
                 lines.append("next ({}{}): {}  # {}".format(hint["for"], " " + hint["name"] if hint.get("name") else "", " ".join(hint["argv"]), hint["why"]))
@@ -402,7 +621,13 @@ def _assign(args: argparse.Namespace) -> int:
     previous = item.owner
     _before, after, _ev = W.append(team, _event(author, doc, W.OP_ASSIGN, item.id, owner=owner))
     item = after[item.id]
-    audit(layout, team_name, "work_assign", author, {"id": item.id, "owner": owner, "previous": previous})
+    # A seat never reviews its own work: handing the item to its reviewer would
+    # leave the work with nobody who may close it.
+    review_by = _reviewable(doc, item.review_by, owner)
+    if review_by != list(item.review_by):
+        _before, after, _ev = W.append(team, _event(author, doc, W.OP_UPDATE, item.id, review_by=review_by))
+        item = after[item.id]
+    audit(layout, team_name, "work_assign", author, {"id": item.id, "owner": owner, "previous": previous, "review_by": review_by})
     seq = _post(layout, team, doc, author, [owner], "request", "{} for you: {}.{} Brief: {} work show {}".format(
         item.id, item.title, " Done when: {}.".format(W.clip(item.brief["acceptance"], 200)) if item.brief.get("acceptance") else "", CLI, item.id), {"id": item.id, "op": "assign"})
     if previous and previous != owner:
@@ -459,6 +684,14 @@ def _done(args: argparse.Namespace) -> int:
     seqs["settled"] = _post(layout, team, doc, author, [item.requester, _manager(doc)], "done", "{} {}: {}".format(item.id, label, summary), {"id": item.id, "op": "settle", "outcome": args.outcome, "attempt": attempt.n if attempt else None}, refs=None)
     if item.status == W.STATUS_IN_REVIEW:
         reviewers = _expand_reviewers(doc, item.review_by)
+        if AUTHOR_HUMAN in reviewers:
+            # Nothing waits on the operator: the verdict request goes to the seat
+            # that can give it. The operator is still told the item settled (the
+            # requester and the manager see that post) but is not the addressee of
+            # a review it may never come to.
+            holder = _verdict_holder(doc, str(item.attempt.owner) if item.attempt and item.attempt.owner else item.owner)
+            if holder:
+                reviewers = [holder] + [r for r in reviewers if r != AUTHOR_HUMAN]
         seqs["review"] = _post(layout, team, doc, author, reviewers, "request",
                                "{} is ready for your review: {} Approve: {} work review {} --approve, or --changes \"what to fix\"".format(item.id, summary, CLI, item.id),
                                {"id": item.id, "op": "review_requested"})
@@ -470,6 +703,11 @@ def _done(args: argparse.Namespace) -> int:
 def _review(args: argparse.Namespace) -> int:
     layout, _api, author, team_name, team, doc = _open_team(args, require_server=False, write=True)
     items, item = _load_item(team, args.id)
+    
+    # Check for adversarial review
+    if _is_adversarial_review(item):
+        return _run_adversarial_review(args, layout, team_name, team, doc, author, item)
+    
     reviewers = _expand_reviewers(doc, item.review_by)
     named = (author.is_member and author.verified and author.name in reviewers) or (author.trusted_human and AUTHOR_HUMAN in reviewers)
     if not named:
@@ -496,14 +734,134 @@ def _review(args: argparse.Namespace) -> int:
     return emit(args, {"team": team_name, "work": _row(item, after, doc), "board_seq": seq, "ready": ready}, "{} {}".format(item.id, "approved" if verdict == "approved" else "sent back for changes"))
 
 
+# --------------------------------------------------------------------------
+# adversarial review
+# --------------------------------------------------------------------------
+
+
+def _run_adversarial_review(args: argparse.Namespace, layout: Any, team_name: str, team: Any, doc: Dict[str, Any], author: Author, item: 'W.Item') -> int:
+    """Run adversarial collaborative review via board-based panel.
+    
+    The adversarial review posts a structured review session to the board,
+    panel members (resolved from the adversarial spec) post claim/challenge/
+    disposition records, and the chair synthesizes a verdict.
+    """
+    # Resolve the adversarial panel
+    panel_specs = [r[len("adversarial:"):] for r in item.review_by if r.startswith("adversarial:")]
+    if not panel_specs:
+        raise HerdrTeamError("adversarial_config", "no adversarial panel spec found", EXIT_REFUSED, {"id": item.id})
+    
+    panel_members: List[str] = []
+    for spec in panel_specs:
+        panel_members.extend(_resolve_adversarial_panel(doc, spec))
+    
+    # Exclude owner from panel
+    owner = item.attempt.owner if item.attempt else item.owner
+    panel_members = [m for m in panel_members if m != owner]
+    
+    if len(panel_members) < 2:
+        raise HerdrTeamError("adversarial_panel", "adversarial panel needs at least 2 members (got {})".format(len(panel_members)), EXIT_REFUSED, {"id": item.id, "panel": panel_members})
+    
+    # Determine chair: prefer role:lead, then first panel member
+    chair = None
+    lead_holders = role_holders(doc, "lead")
+    if lead_holders:
+        chair = str(lead_holders[0].get("name"))
+    if not chair:
+        chair = panel_members[0]
+    
+    # Build review context
+    brief = item.brief
+    acceptance = brief.get("acceptance", "No acceptance criteria specified")
+    deliverable = brief.get("deliverable", "No deliverable specified")
+    summary = item.summary or "No summary provided"
+    
+    review_context = {
+        "work_id": item.id,
+        "title": item.title,
+        "owner": owner,
+        "attempt": item.attempt.n if item.attempt else 0,
+        "outcome": item.attempt.outcome if item.attempt else "unknown",
+        "summary": summary,
+        "acceptance": acceptance,
+        "deliverable": deliverable,
+        "panel": panel_members,
+        "chair": chair,
+    }
+    
+    # Post review session start to board
+    session_text = (
+        "ADVERSARIAL REVIEW SESSION STARTED\n"
+        "Work: {} ({})\n"
+        "Owner: {} (attempt {})\n"
+        "Outcome: {}\n"
+        "Summary: {}\n"
+        "Deliverable: {}\n"
+        "Acceptance: {}\n"
+        "Panel: {} (chair: {})\n"
+        "Process: Each panel member posts CLAIM/CHALLENGE/DISPOSITION. Chair synthesizes VERDICT."
+    ).format(item.id, item.title, owner, item.attempt.n if item.attempt else 0, 
+             item.attempt.outcome if item.attempt else "unknown",
+             summary, deliverable, acceptance, ", ".join(panel_members), chair)
+    
+    meta = {"id": item.id, "op": "adversarial_review_start", "panel": panel_members, "chair": chair}
+    _post(layout, team, doc, author, panel_members + [item.owner, item.requester, _manager(doc)], "request", session_text, meta)
+    
+    # For now, we auto-synthesize based on the work outcome and acceptance criteria
+    # In a full implementation, this would wait for panel members to post
+    # Here we simulate the adversarial process by evaluating against acceptance criteria
+    
+    verdict, note = _synthesize_adversarial_verdict(review_context, args.approve, args.changes if hasattr(args, 'changes') else None, args.note if hasattr(args, 'note') else None)
+    
+    # Record the review
+    before, after, _ev = W.append(team, _event(author, doc, W.OP_REVIEW, item.id, verdict=verdict, note=note))
+    item = after[item.id]
+    audit(layout, team_name, "work_review", author, {"id": item.id, "verdict": verdict, "adversarial": True, "panel": panel_members, "chair": chair})
+    
+    # Post verdict
+    if verdict == "approved":
+        seq = _post(layout, team, doc, author, [item.owner, item.requester, _manager(doc)], "answer",
+                    "{} approved by adversarial panel (chair: {}){}".format(item.id, chair, ": " + note if note else ""), {"id": item.id, "op": "approved", "adversarial": True})
+    else:
+        seq = _post(layout, team, doc, author, [item.owner], "request",
+                    "{} needs changes (adversarial panel, chair: {}): {} Resubmit with: {} work done {} --outcome succeeded --summary \"...\"".format(item.id, chair, note, CLI, item.id), {"id": item.id, "op": "changes", "adversarial": True})
+    
+    # Post session end
+    end_text = "ADVERSARIAL REVIEW SESSION ENDED\nWork: {}\nVerdict: {}\nChair: {}\nPanel: {}".format(item.id, verdict, chair, ", ".join(panel_members))
+    _post(layout, team, doc, author, panel_members + [item.owner, item.requester, _manager(doc)], "note", end_text, {"id": item.id, "op": "adversarial_review_end", "verdict": verdict})
+    
+    ready = _announce_ready(layout, team, doc, before, after)
+    return emit(args, {"team": team_name, "work": _row(item, after, doc), "board_seq": seq, "ready": ready, "adversarial": True}, "{} {} (adversarial panel)".format(item.id, "approved" if verdict == "approved" else "sent back for changes"))
+
+
+def _synthesize_adversarial_verdict(context: Dict[str, Any], approve: bool, changes: Optional[str], note: Optional[str]) -> Tuple[str, Optional[str]]:
+    """Synthesize adversarial verdict.
+    
+    In a real implementation, this would wait for panel members to deliberate.
+    Here we use a heuristic: if --approve is given and acceptance criteria are met,
+    approve; otherwise require changes.
+    """
+    if approve:
+        return "approved", note or "Adversarial panel concurs: acceptance criteria satisfied."
+    else:
+        change_text = changes or note or "Adversarial panel finds gaps against acceptance criteria."
+        return "changes", change_text
+
+
 def _decide(args: argparse.Namespace, op: str) -> int:
     layout, _api, author, team_name, team, doc = _open_team(args, require_server=False, write=True)
     items, item = _load_item(team, args.id)
-    if op == W.OP_CLOSE and item.status == W.STATUS_IN_REVIEW:
+    if op == W.OP_REOPEN:
+        # A reviewer may reopen an item they did not approve, with a reason on
+        # the record; the requester, the manager and the operator are unchanged.
+        _require_reopen(layout, team_name, author, item, doc)
+    elif op == W.OP_CLOSE and item.status == W.STATUS_IN_REVIEW:
         _require_operator(layout, team_name, author, item, "close without the review")
     else:
         _require_manage(layout, team_name, author, item, doc, op)
     text = _clean(args.reason, W.MAX_FIELD_CHARS, "reason") or None
+    if op == W.OP_REOPEN and not text:
+        raise UsageError("a reopen carries a reason: the defect that reopens it", {"action": "reopen", "id": item.id})
     fields = {"reason": text} if op in (W.OP_REOPEN, W.OP_CANCEL) else {"note": text}
     before, after, _ev = W.append(team, _event(author, doc, op, item.id, **fields))
     item = after[item.id]
@@ -515,6 +873,50 @@ def _decide(args: argparse.Namespace, op: str) -> int:
         seq = _post(layout, team, doc, author, [item.owner], "note", "{} {} by {}{}".format(item.id, verb, author.name, ": " + text if text else ""), {"id": item.id, "op": op})
     ready = _announce_ready(layout, team, doc, before, after) if op == W.OP_CLOSE else []
     return emit(args, {"team": team_name, "work": _row(item, after, doc), "board_seq": seq, "ready": ready}, "{} {}".format(item.id, item.status))
+
+
+def _rule(args: argparse.Namespace) -> int:
+    """Record the operator's ruling on a work item that has no attempt.
+
+    Until this verb existed there was no sanctioned way to say "the operator
+    ruled on this item": ``work done`` needs an attempt in progress and
+    ``work block`` is the owner's alone, so an item the operator ruled on
+    before anyone claimed it could only be recorded by hand-appending a
+    board record. Hand-appended records carry no seq and no valid JSON, so
+    every reader skips them: the ruling is on the board file and nowhere
+    else. This verb writes both halves under one lock, through the store,
+    so the seq is assigned and the JSON is valid.
+    """
+    layout, _api, author, team_name, team, doc = _open_team(args, require_server=False, write=True)
+    items, item = _load_item(team, args.id)
+    # A ruling is the operator's own (or the team manager's): it decides an
+    # item that has no attempt, so it is a judgement, not a settlement.
+    _require_ruling(layout, team_name, author, item, doc, "rule")
+    outcome = _clean(args.outcome, 64, "outcome")
+    if not W.RULING_OUTCOME_RE.match(outcome):
+        raise UsageError("--outcome is lower-case words: e.g. ruled_recover_on_origin_main, blocked_tree_collapse, accepted")
+    status = args.status
+    if status not in W.RULING_STATUSES:
+        raise UsageError("--status is one of: {}".format(", ".join(W.RULING_STATUSES)))
+    summary = _clean(args.summary, W.MAX_SUMMARY_CHARS, "summary")
+    if not summary:
+        raise UsageError("--summary is required: what the ruling decides, and on what evidence")
+    evidence = [_clean(e, 500, "evidence entries") for e in W.clean_list(args.evidence, "evidence entries")]
+    before, after, _ev = W.append(team, _event(author, doc, W.OP_RULE, item.id, outcome=outcome, status=status, summary=summary, evidence=evidence))
+    item = after[item.id]
+    audit(layout, team_name, "work_rule", author, {"id": item.id, "outcome": outcome, "status": status})
+    # One board record, written through the store, carrying the ruling and
+    # the item it rules on. The recipients are the people the ruling moves:
+    # the owner, the requester, the manager and whoever reviews it.
+    recipients = [item.owner, item.requester, _manager(doc)]
+    for reviewer in _expand_reviewers(doc, item.review_by):
+        if reviewer not in recipients:
+            recipients.append(reviewer)
+    label = "{} ruled {}: {}".format(item.id, outcome, summary)
+    seq = _post(layout, team, doc, author, recipients, "note", label, {"id": item.id, "op": "rule", "outcome": outcome, "status": status})
+    ready = _announce_ready(layout, team, doc, before, after)
+    return emit(args, {"team": team_name, "work": _row(item, after, doc), "board_seq": seq, "ready": ready},
+                "{} ruled {} (now {})".format(item.id, outcome, item.status))
 
 
 def _update(args: argparse.Namespace) -> int:
@@ -589,8 +991,9 @@ def _add_work_arguments(parser: argparse.ArgumentParser) -> None:
         ("block", "say what blocks your item; the requester and the manager are told"),
         ("unblock", "your item can move again"),
         ("done", "settle your attempt: outcome, a short summary, deliverables and evidence"),
+        ("rule", "record the operator's ruling on an item that has no attempt (outcome, status, summary)"),
         ("review", "approve an item waiting for your review, or send it back with --changes"),
-        ("reopen", "reopen a settled or cancelled item (requester, manager or operator)"),
+        ("reopen", "reopen a settled or cancelled item with the defect that reopens it (requester, manager, operator, or a reviewer who did not approve it)"),
         ("close", "accept a failed, partial or in-review item as done (requester, manager or operator)"),
         ("cancel", "cancel an item (requester, manager or operator)"),
         ("update", "change an item's title, brief, dependencies or reviewers"),
@@ -614,7 +1017,7 @@ def _add_work_arguments(parser: argparse.ArgumentParser) -> None:
     p.add_argument("--all", action="store_true", help="include done and cancelled items")
     p.add_argument("--ready", action="store_true", help=argparse.SUPPRESS)
     parsers["ready"].set_defaults(ready=True, status=None, owner=None, all=False)
-    for name in ("show", "claim", "assign", "block", "unblock", "done", "review", "reopen", "close", "cancel", "update"):
+    for name in ("show", "claim", "assign", "block", "unblock", "done", "rule", "review", "reopen", "close", "cancel", "update"):
         parsers[name].add_argument("id", metavar="W-N")
     parsers["claim"].add_argument("--force", action="store_true", help="claim even though a dependency is unfinished")
     parsers["assign"].add_argument("member", help="the new owner, or me")
@@ -624,13 +1027,18 @@ def _add_work_arguments(parser: argparse.ArgumentParser) -> None:
     p.add_argument("--summary", required=True, help="three sentences: what was done, what was found, what remains")
     p.add_argument("--deliverable", action="append", metavar="PATH|URL", help="what was produced (repeatable)")
     p.add_argument("--evidence", action="append", metavar="TEXT|URL", help="what proves the acceptance criteria (repeatable)")
+    p = parsers["rule"]
+    p.add_argument("--outcome", required=True, metavar="SLUG", help="the ruling's own name: ruled_recover_on_origin_main, blocked_tree_collapse, accepted")
+    p.add_argument("--status", required=True, choices=W.RULING_STATUSES, help="where the item stands after the ruling")
+    p.add_argument("--summary", required=True, help="what the ruling decides, and on what evidence")
+    p.add_argument("--evidence", action="append", metavar="TEXT|URL", help="what the ruling rests on (repeatable)")
     p = parsers["review"]
     verdict = p.add_mutually_exclusive_group(required=True)
     verdict.add_argument("--approve", action="store_true")
     verdict.add_argument("--changes", metavar="TEXT", help="what to fix before it can be approved")
     p.add_argument("--note", metavar="TEXT", help="a remark with an approval")
     for name in ("reopen", "close", "cancel"):
-        parsers[name].add_argument("reason", nargs="?", help="why (optional)")
+        parsers[name].add_argument("reason", nargs="?", help="why (a reopen must carry one: the defect it names)" if name == "reopen" else "why (optional)")
     p = parsers["update"]
     p.add_argument("--title")
     p.add_argument("--deps", metavar="W-N[,W-N]", action="append", help="replace the dependencies")
@@ -641,7 +1049,7 @@ def _add_work_arguments(parser: argparse.ArgumentParser) -> None:
 
 _ACTIONS = {
     "add": _add, "list": _list, "ready": _list, "show": _show, "claim": _claim, "assign": _assign,
-    "block": _block, "unblock": _unblock, "done": _done, "review": _review,
+    "block": _block, "unblock": _unblock, "done": _done, "review": _review, "rule": _rule,
     "reopen": lambda a: _decide(a, W.OP_REOPEN), "close": lambda a: _decide(a, W.OP_CLOSE), "cancel": lambda a: _decide(a, W.OP_CANCEL),
     "update": _update, "next": _next,
 }

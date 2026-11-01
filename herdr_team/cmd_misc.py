@@ -28,6 +28,7 @@ from herdr_team import gate
 from herdr_team import PLUGIN_ID, VERSION
 from herdr_team import api as _api
 from herdr_team import operator as _operator
+from herdr_team import platform_compat as _platform_compat
 from herdr_team import cli as _cli
 from herdr_team import paths as _paths
 from herdr_team import roster as _roster
@@ -494,6 +495,36 @@ def _toast_probe(api: Any) -> Dict[str, Any]:
     return {"probed": True, "shown": shown, "reason": str(reason or ("shown" if shown else "unknown"))}
 
 
+def _board_integrity(layout: Any, team_name: str) -> Dict[str, Any]:
+    """Count the board records no reader can use: unparseable lines and reused seqs.
+
+    A record appended straight into ``board.jsonl`` instead of through
+    ``BoardStore.append`` gets neither valid JSON nor a free seq: every reader skips the
+    line, and the daemon's tailer drops it -- silently, to everyone but the log file. A
+    ruling lost that way reads as a team that never heard it (observed 2026-10-31: the
+    operator's W-60 ruling was unreadable for minutes and nobody could tell). This makes
+    the damage visible where the operator looks.
+    """
+    from herdr_team import store as _store
+
+    try:
+        team = layout.session.team(team_name)
+        data = _store.read_bytes(team.board_jsonl, default=b"") or b""
+        records, stats = _store.parse_lines(data)
+    except (HerdrTeamError, OSError):
+        return {"corrupt": 0, "fragments": 0, "duplicate_seqs": []}
+    counts: Dict[int, int] = {}
+    for rec in records:
+        seq = rec.get("seq")
+        if isinstance(seq, int):
+            counts[seq] = counts.get(seq, 0) + 1
+    return {
+        "corrupt": int(stats.get("corrupt") or 0),
+        "fragments": int(stats.get("fragment") or 0),
+        "duplicate_seqs": sorted(s for s, c in counts.items() if c > 1),
+    }
+
+
 def _run_doctor(args: argparse.Namespace) -> int:
     env = env_of(args)
     warnings: List[str] = []
@@ -605,11 +636,21 @@ def _run_doctor(args: argparse.Namespace) -> int:
             missing_missions = []
             with_missions = 0
             warnings.append("team {} Mission check failed: {}".format(name, err))
-        teams.append({"team": name, "members": len(members), "missing": missing, "missions": with_missions, "missing_missions": missing_missions})
+        integrity = _board_integrity(layout, name)
+        teams.append({"team": name, "members": len(members), "missing": missing, "missions": with_missions,
+                      "missing_missions": missing_missions, "board": integrity})
         if missing_missions:
             warnings.append("team {} has no Mission for: {}".format(name, ", ".join(missing_missions)))
         if doc.get("socket") and os.path.realpath(str(doc["socket"])) != os.fspath(layout.socket):
             warnings.append("team {} belongs to socket {}".format(name, doc["socket"]))
+        if integrity["corrupt"] or integrity["duplicate_seqs"]:
+            # A record no reader can use is a record the team never heard. Name it.
+            warnings.append(
+                "team {} board has {} unreadable record(s) and {} reused seq(s) ({}): every reader skips them "
+                "and the daemon's tailer drops them, so a post made that way never reaches anyone. "
+                "Re-post it with `herdr-synapse post`, never by writing board.jsonl directly.".format(
+                    name, integrity["corrupt"], len(integrity["duplicate_seqs"]),
+                    ", ".join(str(s) for s in integrity["duplicate_seqs"][:8]) or "none"))
     console = read_console_json(layout.session)
     console_open = bool(console.get("open")) and pid_alive(int(console.get("pid") or 0))
     payload = {
@@ -680,15 +721,99 @@ def _add_install_cli_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dir", metavar="PATH", help="install directory (default ~/.local/bin)")
 
 
+#: The Windows PATH shim. It resolves the plugin root from herdr's own registry
+#: (the plugin is a local link, and the root moves on reinstall) and then calls
+#: the root's own launcher, which sets PYTHONPATH, HERDR_TEAM_ROOT and the
+#: UTF-8 variables (2026-10-21 port fix).
+_WINDOWS_SHIM_TEMPLATE = (
+    "@echo off\r\n"
+    "REM {marker}\r\n"
+    "REM The plugin root is resolved from herdr's own registry at run time: the\r\n"
+    "REM plugin is installed as a local link, so a baked-in path would break on\r\n"
+    "REM the next reinstall. The root's own launcher does the rest.\r\n"
+    "setlocal\r\n"
+    "set \"HERDR_SYNAPSE_ROOT=\"\r\n"
+    "for /f \"usebackq delims=\" %%r in (`powershell -NoProfile -ExecutionPolicy Bypass -Command \"$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $b=$env:HERDR_BIN_PATH; if(-not $b){$b='herdr'}; $p=(((& $b plugin list --json|ConvertFrom-Json).result.plugins|?{$_.plugin_id -eq 'herdr-synapse'}|Select-Object -First 1).plugin_root); if($p -and $p.StartsWith('\\\\?\\')){$p=$p.Substring(4)}; $p\"`) do set \"HERDR_SYNAPSE_ROOT=%%r\"\r\n"
+    "if not defined HERDR_SYNAPSE_ROOT (\r\n"
+    "    echo herdr-synapse: plugin not installed 1>&2\r\n"
+    "    exit /b 1\r\n"
+    ")\r\n"
+    "if not exist \"%HERDR_SYNAPSE_ROOT%\\bin\\herdr-synapse.cmd\" (\r\n"
+    "    echo herdr-synapse: launcher not found under %HERDR_SYNAPSE_ROOT% 1>&2\r\n"
+    "    exit /b 1\r\n"
+    ")\r\n"
+    "call \"%HERDR_SYNAPSE_ROOT%\\bin\\herdr-synapse.cmd\" %*\r\n"
+    "exit /b %ERRORLEVEL%\r\n"
+)
+
+
 def _run_install_cli(args: argparse.Namespace) -> int:
     env = env_of(args)
     home = _paths.home_dir(env)
-    target = _paths.plugin_root() / "bin" / "herdr-synapse"
+    target = _paths.cli_launcher_path()
     directory = Path(os.path.expanduser(args.dir)) if args.dir else home / ".local" / "bin"
     link = directory / "herdr-synapse"
     created = False
     replaced = False
     existing = None
+    if os.name == "nt":
+        # Windows has no symlink by default (it needs a privilege or developer
+        # mode) and the unix target is a sh script Windows cannot run at all.
+        # The portable equivalent is a .cmd shim that calls the ported launcher
+        # (2026-10-21 port fix).
+        shim = directory / "herdr-synapse.cmd"
+        marker = "rem herdr-synapse launcher shim (Windows)"
+        if shim.exists():
+            existing = "file"
+        if args.yes:
+            _paths.ensure_dir(directory, 0o755)
+            # The shim resolves the plugin root from herdr's own registry
+            # rather than baking a path in: the plugin is installed as a local
+            # link, and the root moves whenever the link is re-pointed or the
+            # plugin is re-installed. It then calls the root's own launcher,
+            # which sets PYTHONPATH / HERDR_TEAM_ROOT / the UTF-8 variables
+            # (2026-10-21 port fix - a hardcoded path is a dead end after the
+            # next reinstall).
+            # NB: a plain replace, not str.format: the PowerShell snippet is
+            # full of braces, and format() would read them as fields.
+            body = _WINDOWS_SHIM_TEMPLATE.replace("{marker}", marker)
+            if shim.exists():
+                # Compare bytes: reading text would normalise the line endings and make an
+                # unchanged shim look replaced.
+                previous = shim.read_bytes().decode("utf-8", "replace")
+                if marker not in previous:
+                    # Same rule as the unix branch: never overwrite a file that
+                    # is not ours.
+                    raise HerdrTeamError(
+                        "path_exists",
+                        "{} exists and is not a herdr-synapse shim; remove it first".format(shim),
+                        EXIT_REFUSED,
+                        {"path": os.fspath(shim)},
+                    )
+                if previous == body:
+                    replaced = False
+                else:
+                    shim.write_text(body, encoding="utf-8", newline="")
+                    replaced = True
+            else:
+                shim.write_text(body, encoding="utf-8", newline="")
+                created = True
+        payload = {
+            "path": os.fspath(shim),
+            "target": os.fspath(target),
+            "created": created,
+            "replaced": replaced,
+            "dry_run": not args.yes,
+            "existing": existing,
+            "kind": "cmd_shim",
+        }
+        if not args.yes:
+            human = "would write the shim {} -> {} (pass --yes)".format(shim, target)
+        else:
+            human = "{} -> {} ({})".format(
+                shim, target, "created" if created else "replaced" if replaced else "already installed"
+            )
+        return emit(args, payload, human)
     if link.is_symlink() or link.exists():
         existing = os.readlink(link) if link.is_symlink() else "file"
     if args.yes:
@@ -696,12 +821,15 @@ def _run_install_cli(args: argparse.Namespace) -> int:
         if link.is_symlink():
             if os.path.realpath(link) != os.path.realpath(target):
                 os.unlink(link)
-                os.symlink(target, link)
+                # through the product helper, so a machine that cannot create
+                # symlinks at all is told so in the CLI's own error shape
+                # instead of a raw WinError 1314 traceback (2026-10-21, W-9).
+                _platform_compat.symlink_or_raise(target, link)
                 replaced = True
         elif link.exists():
             raise HerdrTeamError("path_exists", "{} exists and is not a symlink; remove it first".format(link), EXIT_REFUSED, {"path": os.fspath(link)})
         else:
-            os.symlink(target, link)
+            _platform_compat.symlink_or_raise(target, link)
             created = True
     payload = {"path": os.fspath(link), "target": os.fspath(target), "created": created, "replaced": replaced, "dry_run": not args.yes, "existing": existing}
     if not args.yes:

@@ -253,6 +253,55 @@ class DecisionsAndHints(Rig):
         self.assertEqual([(r["attention"], r["argv"]) for r in next_rows], [("ready", ["herdr-synapse", "work", "claim", "W-1"])])
         self.assertEqual(self.ok(self.worker("work", "claim", "W-1"))["work"]["attempt"]["n"], 2)
 
+    def test_a_reviewer_reopens_a_settled_item_they_did_not_approve(self):
+        """A reviewer's reopen-for-a-defect path: the reviewer did not approve,
+        so the settled item is theirs to reopen with a reason on the record
+        (W-38). Proved by a reviewer doing exactly that, not by the error path."""
+        self.ok(self.human("work", "add", "Draft outline", "--to", WORKER, "--review-by", REVIEWER, "--quick"))
+        self.ok(self.worker("work", "claim", "W-1"))
+        self.ok(self.worker("work", "done", "W-1", "--outcome", "succeeded", "--summary", "Drafted the outline. Five sections. Awaiting review."))
+        # the reviewer never approves; the requester accepts it by decision instead
+        self.assertEqual(self.ok(self.human("work", "close", "W-1", "good enough for now"))["work"]["status"], "done")
+        reason = "section 3 restates section 2; the split has to come back"
+        item = self.ok(self.reviewer("work", "reopen", "W-1", reason))["work"]
+        self.assertEqual((item["status"], item["owner"], item["attempt"]), ("assigned", WORKER, None))
+        # the reason and the author are on the record: the item's own event log
+        record = W.load(self.ts.team)["W-1"]
+        reopened = [h for h in record.history if h["op"] == "reopen"]
+        self.assertEqual((reopened[-1]["by"], reopened[-1]["reason"]), (REVIEWER, reason))
+        # the attempts and reviews already on the item stay on the record
+        self.assertEqual([(a["n"], a["outcome"]) for a in item["attempts"]], [(1, "succeeded")])
+        # the item is claimable again, as a new attempt
+        self.assertEqual(self.ok(self.worker("work", "claim", "W-1"))["work"]["attempt"]["n"], 2)
+        # and the owner was told
+        self.assertIn("reopened", " ".join(p["text"] for p in self.posts_about("W-1")))
+
+    def test_a_reviewer_may_not_reopen_an_item_they_approved(self):
+        """The misuse: the reviewer approved the attempt being reopened, so the
+        reopen is refused and the refusal names why (W-38). The requester's
+        and the manager's paths are unchanged."""
+        self.ok(self.human("work", "add", "Draft outline", "--to", WORKER, "--review-by", REVIEWER, "--quick"))
+        self.ok(self.worker("work", "claim", "W-1"))
+        self.ok(self.worker("work", "done", "W-1", "--outcome", "succeeded", "--summary", "Drafted the outline. Five sections. Awaiting review."))
+        self.ok(self.reviewer("work", "review", "W-1", "--approve"))
+        self.assertEqual(self.ok(self.reviewer("work", "show", "W-1"))["work"]["status"], "done")
+        code, _payload, err = self.reviewer("work", "reopen", "W-1", "section 3 restates section 2")
+        self.assertEqual((code, err["code"]), (1, "author_mismatch"))
+        self.assertIn("approved", err["message"])
+        self.assertIn("requester", err["message"])
+        # the owner is not a decider either
+        code, _payload, err = self.worker("work", "reopen", "W-1", "section 3 restates section 2")
+        self.assertEqual((code, err["code"]), (1, "author_mismatch"))
+        # a reopen with no reason is a usage error, for everyone
+        code, _payload, err = self.human("work", "reopen", "W-1")
+        self.assertEqual((code, err["code"]), (2, "usage"))
+        # the requester path is unchanged
+        self.assertEqual(self.ok(self.human("work", "reopen", "W-1", "section 3 restates section 2"))["work"]["status"], "assigned")
+        # and the reviewer may reopen the NEW attempt, which they did not approve
+        self.ok(self.worker("work", "claim", "W-1"))
+        self.ok(self.worker("work", "done", "W-1", "--outcome", "succeeded", "--summary", "Split back into two sections. Ready for review."))
+        self.assertEqual(self.ok(self.reviewer("work", "reopen", "W-1", "section 4 now restates section 2"))["work"]["status"], "assigned")
+
     def test_list_rows_carry_attention_and_the_next_command(self):
         self.ok(self.human("work", "add", "Open item", "--quick"))
         rows = self.ok(self.human("work", "list"))["work"]
@@ -271,6 +320,102 @@ class DecisionsAndHints(Rig):
         store.write_json(self.ts.team.team_json, doc)
         hints = self.ok(self.human("work", "show", "W-1"))["work"]["hints"]
         self.assertEqual((hints[0]["attention"], hints[0]["argv"]), ("owner_absent", ["herdr-synapse", "resume", WORKER]))
+
+
+class Rulings(Rig):
+    """The operator's ruling on an item that has no attempt.
+
+    Until ``work rule`` existed there was no sanctioned way to record one:
+    ``work done`` needs an attempt in progress, ``work block`` is the owner's
+    alone, and the outcome vocabulary had no room for a ruling's own slug.
+    The only way left was to hand-append a board record, which gets neither a
+    seq nor valid JSON -- so every reader skips it and the ruling exists
+    only in the log file. These tests prove the sanctioned path: both halves
+    written, through the store, by the verbs themselves.
+    """
+
+    def test_the_operator_rules_on_an_item_nobody_has_started(self):
+        self.ok(self.human("work", "add", "GAP-B20 ruling", "--to", WORKER, "--quick"))
+        payload = self.ok(self.human("work", "rule", "W-1", "--outcome", "ruled_recover_on_origin_main",
+                                     "--status", "blocked",
+                                     "--summary", "The collapse was an unintended whole-index wipe. Recovery is on origin/main."))
+        item = payload["work"]
+        self.assertEqual((item["status"], item["owner"]), ("blocked", WORKER))
+        # the ruling is on the item, with its author and its own outcome slug
+        self.assertEqual([(r["by"], r["outcome"], r["status"]) for r in item["rulings"]],
+                         [("human", "ruled_recover_on_origin_main", "blocked")])
+        # and the item's brief summary is the ruling's summary
+        self.assertEqual(item["summary"], "The collapse was an unintended whole-index wipe. Recovery is on origin/main.")
+        # the ledger carries it, so a reader of work.jsonl alone sees the ruling
+        record = W.load(self.ts.team)["W-1"]
+        self.assertEqual([h["op"] for h in record.history], ["create", "rule"])
+
+    def test_the_ruling_reaches_the_board_as_a_readable_record(self):
+        self.ok(self.human("work", "add", "GAP-B20 ruling", "--to", WORKER, "--review-by", REVIEWER, "--quick"))
+        payload = self.ok(self.human("work", "rule", "W-1", "--outcome", "ruled_recover_on_origin_main",
+                                     "--status", "blocked", "--summary", "Recovery is on origin/main."))
+        seq = payload["board_seq"]
+        self.assertIsInstance(seq, int)
+        posts = self.posts_about("W-1")
+        [post] = [p for p in posts if p["work"]["op"] == "rule"]
+        self.assertEqual(post["seq"], seq)
+        # the record is one the board's own readers accept: valid JSON, a
+        # free seq, and the outcome slug the ruling was recorded under
+        self.assertEqual((post["work"]["outcome"], post["work"]["status"]),
+                         ("ruled_recover_on_origin_main", "blocked"))
+        self.assertIn("ruled_recover_on_origin_main", post["text"])
+        # the owner and the reviewer are told (the author is not)
+        self.assertIn(WORKER, post["to"])
+        self.assertIn(REVIEWER, post["to"])
+
+    def test_the_ruling_is_the_operators_or_the_managers_not_a_teammates(self):
+        self.ok(self.human("work", "add", "GAP-B20 ruling", "--to", WORKER, "--quick"))
+        # a plain member may not rule on the team's work
+        code, _payload, err = self.worker("work", "rule", "W-1", "--outcome", "accepted",
+                                           "--status", "done", "--summary", "Looks fine to me.")
+        self.assertEqual((code, err["code"]), (1, "author_mismatch"))
+        # the manager may
+        doc = store.read_json(self.ts.team.team_json)
+        for m in doc["members"]:
+            if m["name"] == REVIEWER:
+                m["manager"] = True
+        store.write_json(self.ts.team.team_json, doc)
+        item = self.ok(self.reviewer("work", "rule", "W-1", "--outcome", "accepted",
+                                     "--status", "done", "--summary", "Accepted by the manager."))["work"]
+        self.assertEqual(item["status"], "done")
+
+    def test_a_ruling_cannot_carry_a_malformed_outcome_or_an_impossible_status(self):
+        self.ok(self.human("work", "add", "GAP-B20 ruling", "--to", WORKER, "--quick"))
+        # an outcome slug is lower-case words: it lands in a status
+        code, _payload, err = self.human("work", "rule", "W-1", "--outcome", "Not A Slug!",
+                                         "--status", "done", "--summary", "x")
+        self.assertEqual((code, err["code"]), (2, "usage"))
+        # and a ruling says what it decides: an empty summary is refused
+        code, _payload, err = self.human("work", "rule", "W-1", "--outcome", "accepted",
+                                         "--status", "done", "--summary", "")
+        self.assertEqual((code, err["code"]), (1, "text_empty"))
+        # a status a ruling may not leave is refused too
+        code, _payload, err = self.human("work", "rule", "W-1", "--outcome", "accepted",
+                                         "--status", "in_progress", "--summary", "x")
+        self.assertEqual((code, err["code"]), (2, "usage"))
+
+    def test_a_ruling_cannot_reopen_something_already_finished(self):
+        self.ok(self.human("work", "add", "GAP-B20 ruling", "--to", WORKER, "--quick"))
+        self.ok(self.worker("work", "claim", "W-1"))
+        self.ok(self.worker("work", "done", "W-1", "--outcome", "succeeded", "--summary", "Done."))
+        code, _payload, err = self.human("work", "rule", "W-1", "--outcome", "accepted",
+                                         "--status", "done", "--summary", "Too late.")
+        self.assertEqual((code, err["code"]), (1, "work_final"))
+        self.assertIn("reopen", err["message"])
+
+    def test_work_done_still_refuses_an_item_with_no_attempt(self):
+        """The gap the ruling verb closes: ``work done`` cannot express a
+        decision about an item nobody has started -- not even for the owner,
+        who is the one who would settle it."""
+        self.ok(self.human("work", "add", "GAP-B20 ruling", "--to", WORKER, "--quick"))
+        code, _payload, err = self.worker("work", "done", "W-1", "--outcome", "succeeded", "--summary", "x")
+        self.assertEqual((code, err["code"]), (1, "work_not_active"))
+        self.assertIn("no attempt in progress", err["message"])
 
 
 class Orientation(Rig):
@@ -415,3 +560,141 @@ class Model(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewRouting(Rig):
+    """Nothing waits on the operator: an item that names the operator also names the manager.
+
+    A review slot only the operator can fill is a review that never happens: the
+    operator is not in the team's loop, so the verdict has to have an agent who can
+    give it. The manager is named alongside the operator, which is enough -- a named
+    reviewer may review, so the manager needs no operator grant to give the verdict.
+    """
+
+    def _make_manager(self):
+        doc = store.read_json(self.ts.team.team_json)
+        for m in doc["members"]:
+            if m["name"] == REVIEWER:
+                m["manager"] = True
+        store.write_json(self.ts.team.team_json, doc)
+
+    def test_an_item_that_names_the_operator_also_names_the_manager(self):
+        self._make_manager()
+        self.ok(self.human("work", "add", "Needs a verdict", "--to", WORKER, "--review-by", "human", "--quick"))
+        item = self.ok(self.human("work", "show", "W-1"))["work"]
+        self.assertIn("human", item["review_by"])
+        self.assertIn(REVIEWER, item["review_by"], "the verdict has an agent who can give it")
+
+    def test_the_manager_may_give_the_verdict_with_no_operator_grant(self):
+        self._make_manager()
+        self.ok(self.human("work", "add", "Needs a verdict", "--to", WORKER, "--review-by", "human", "--quick"))
+        self.ok(self.worker("work", "claim", "W-1"))
+        self.ok(self.worker("work", "done", "W-1", "--outcome", "succeeded", "--summary", "Done."))
+        # the manager is a named reviewer, so it may give the verdict itself
+        item = self.ok(self.reviewer("work", "review", "W-1", "--approve"))["work"]
+        self.assertEqual(item["status"], "done")
+        self.assertEqual([r["by"] for r in item["reviews"]], [REVIEWER])
+
+    def test_a_plain_member_still_cannot_review(self):
+        """Naming the manager does not make everyone a reviewer."""
+        self._make_manager()
+        self.ok(self.human("work", "add", "Needs a verdict", "--to", WORKER, "--review-by", "human", "--quick"))
+        self.ok(self.worker("work", "claim", "W-1"))
+        self.ok(self.worker("work", "done", "W-1", "--outcome", "succeeded", "--summary", "Done."))
+        code, _payload, err = self.worker("work", "review", "W-1", "--approve")
+        self.assertEqual((code, err["code"]), (1, "author_mismatch"))
+
+class VerdictRouting(Rig):
+    """The review request never waits on the operator.
+
+    When an item settles, the request for a verdict is addressed to the seat that
+    can give it: the manager, or the lead when the manager owns the item. The
+    operator is told the item settled, but is not the addressee of a review that
+    may never come to.
+    """
+
+    def _roles(self, manager=None, lead=None):
+        doc = store.read_json(self.ts.team.team_json)
+        for m in doc["members"]:
+            if m["name"] == REVIEWER and manager:
+                m["manager"] = True
+            if m["name"] == WORKER and lead:
+                m["role"] = "lead"
+        store.write_json(self.ts.team.team_json, doc)
+
+    def _review_request(self, work_id="W-1"):
+        posts = [p for p in self.posts_about(work_id) if p.get("work", {}).get("op") == "review_requested"]
+        return posts[-1] if posts else None
+
+    def test_the_review_request_goes_to_the_manager_not_the_operator(self):
+        self._roles(manager=True)
+        self.ok(self.human("work", "add", "Needs a verdict", "--to", WORKER, "--review-by", "human", "--quick"))
+        self.ok(self.worker("work", "claim", "W-1"))
+        self.ok(self.worker("work", "done", "W-1", "--outcome", "succeeded", "--summary", "Done."))
+        request = self._review_request()
+        self.assertIsNotNone(request)
+        self.assertEqual(request["to"], [REVIEWER])
+        self.assertNotIn("human", request["to"])
+
+    def test_an_item_the_manager_owns_gets_its_verdict_from_the_lead(self):
+        # The manager owns the item, so the verdict is the lead's: a seat never
+        # reviews its own work.
+        self._roles(manager=True, lead=True)
+        self.ok(self.human("work", "add", "Needs a verdict", "--to", REVIEWER, "--review-by", "human", "--quick"))
+        self.ok(self.reviewer("work", "claim", "W-1"))
+        self.ok(self.reviewer("work", "done", "W-1", "--outcome", "succeeded", "--summary", "Done."))
+        request = self._review_request()
+        self.assertIsNotNone(request)
+        self.assertEqual(request["to"], [WORKER])
+
+    def test_the_operator_still_learns_the_item_settled(self):
+        """Not being the addressee of the review does not mean being left out."""
+        self._roles(manager=True)
+        self.ok(self.human("work", "add", "Needs a verdict", "--to", WORKER, "--review-by", "human", "--quick"))
+        self.ok(self.worker("work", "claim", "W-1"))
+        self.ok(self.worker("work", "done", "W-1", "--outcome", "succeeded", "--summary", "Done."))
+        settled = [p for p in self.posts_about("W-1") if p.get("work", {}).get("op") == "settle"]
+        self.assertTrue(settled)
+        self.assertIn("human", settled[-1]["to"])
+
+
+class ReassignmentKeepsReviewable(Rig):
+    """Handing an item to its own reviewer would leave the work with nobody.
+
+    A seat never reviews its own work, so an item whose owner becomes its
+    reviewer needs a seat that can give the verdict.
+    """
+
+    def _roles(self):
+        doc = store.read_json(self.ts.team.team_json)
+        for m in doc["members"]:
+            if m["name"] == REVIEWER:
+                m["manager"] = True
+            if m["name"] == WORKER:
+                m["role"] = "lead"
+        store.write_json(self.ts.team.team_json, doc)
+
+    def test_assigning_to_the_reviewer_moves_the_verdict_to_the_lead(self):
+        self._roles()
+        self.ok(self.human("work", "add", "Needs a verdict", "--to", WORKER, "--review-by", REVIEWER, "--quick"))
+        item = self.ok(self.human("work", "assign", "W-1", REVIEWER))["work"]
+        self.assertEqual(item["owner"], REVIEWER)
+        self.assertNotIn(REVIEWER, item["review_by"], "the owner cannot review its own work")
+        self.assertEqual(item["review_by"], [WORKER], "the lead is the seat that can give the verdict")
+
+    def test_the_verdict_is_reviewable_after_the_reassignment(self):
+        self._roles()
+        self.ok(self.human("work", "add", "Needs a verdict", "--to", WORKER, "--review-by", REVIEWER, "--quick"))
+        self.ok(self.human("work", "assign", "W-1", REVIEWER))
+        self.ok(self.reviewer("work", "claim", "W-1"))
+        self.ok(self.reviewer("work", "done", "W-1", "--outcome", "succeeded", "--summary", "Done."))
+        # the lead is the named reviewer now, so it may give the verdict
+        item = self.ok(self.worker("work", "review", "W-1", "--approve"))["work"]
+        self.assertEqual(item["status"], "done")
+
+    def test_an_item_with_no_reviewer_still_settles_on_its_own(self):
+        """The rule only adds a reviewer when one was named and became unusable."""
+        self._roles()
+        self.ok(self.human("work", "add", "No reviewer", "--to", WORKER, "--quick"))
+        item = self.ok(self.human("work", "assign", "W-1", REVIEWER))["work"]
+        self.assertEqual(item["review_by"], [])

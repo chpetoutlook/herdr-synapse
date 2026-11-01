@@ -12,6 +12,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from herdr_team import mission as M
+from herdr_team import paths as _paths
 from herdr_team.cli import Command, api_for, emit, layout_for
 from herdr_team.errors import EXIT_OK, HerdrTeamError
 
@@ -41,8 +42,9 @@ def _run_pane(args: argparse.Namespace) -> int:
 
     env = dict(args.env)
     layout = layout_for(args)
-    if env.get("HERDR_PLUGIN_ENTRYPOINT_ID") != ENTRYPOINT and not getattr(args, "force", False):
+    if not _paths.entrypoint_matches(env, ENTRYPOINT) and not getattr(args, "force", False):
         raise HerdrTeamError("not_a_plugin_pane", "mission-pane runs in the mission popup; use `herdr-synapse ui mission`, `herdr-synapse mission`, or pass --force", 1)
+    _p.require_vendor_curses(env)
     if not _p.socket_allowed(layout.config_dir, layout.socket):
         sys.stderr.write("herdr-synapse mission-pane skipped: socket not allowed\n")
         return EXIT_OK

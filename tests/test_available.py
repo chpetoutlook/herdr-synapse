@@ -13,7 +13,7 @@ import unittest
 from typing import Any, List
 from unittest import mock
 
-from support import TempState, fake_agent
+from support import TempState, fake_agent, requires_posix_sh
 from test_cmd_roster import json_out, live_api, run_cli
 import test_models as rigs
 
@@ -65,6 +65,16 @@ class Rig:
         self.ts = ts
         self.calls: List[List[str]] = []
         self.answer = answer
+        # The fakes below are "#!/bin/sh" scripts.  Windows cannot execute a
+        # /bin/sh script, and this machine has no "sh" on PATH, so the harness
+        # catalog would come back EMPTY and every assertion that reads it
+        # would move.  The product is right (it uses the inherited PATH through
+        # shutil.which and os.defpath); the RIG is what needs a POSIX shell.
+        # The check is for the SHELL, not the platform, so the unix run still
+        # exercises these tests (2026-10-22 port fix, W-31).
+        requires_posix_sh(
+            "the harness rig writes fake harnesses as "#!/bin/sh" scripts and runs them; Windows cannot execute a /bin/sh script, and this machine has no "sh" on PATH (the check is for the SHELL, not the platform, so a unix run still exercises these tests)"
+        )
         self.bin = ts.home / "bin"
         self.bin.mkdir(parents=True, exist_ok=True)
         for kind in INSTALLED:
@@ -381,7 +391,17 @@ class TemplateProfileTests(unittest.TestCase):
         with TempState() as ts:
             folder = ts.home / "tpl" / "review-pair"
             (folder / "roles").mkdir(parents=True)
-            (folder / "team.md").write_text("# Review pair\n\nTwo reviewers.\n\n## Roles\n\n- skeptic: opencode/plan — reads, never edits\n- lead: claude — decides\n")
+            # The template file is written in utf-8, because the PRODUCT reads
+            # it in utf-8 (templates.parse -> read_text(encoding="utf-8")).
+            # Without the explicit encoding the bytes are written in the LOCALE
+            # encoding - cp1252 on Windows, where the em-dash becomes byte 0x97 -
+            # and the read fails with a UnicodeDecodeError. On unix the locale
+            # encoding IS utf-8, so the test passes there and the disagreement
+            # is invisible in the parity run (2026-10-22 port fix, W-32).
+            (folder / "team.md").write_text(
+                "# Review pair\n\nTwo reviewers.\n\n## Roles\n\n- skeptic: opencode/plan — reads, never edits\n- lead: claude — decides\n",
+                encoding="utf-8",
+            )
             template = templates.parse("review-pair", folder, "user")
             self.assertEqual([(r.name, r.kind, r.profile) for r in template.roles], [("skeptic", "opencode", "plan"), ("lead", "claude", None)])
             written = ts.home / "tpl" / "copy"

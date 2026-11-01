@@ -6,6 +6,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -57,9 +58,13 @@ def pane_api():
 
 def write_live_daemon(ts):
     """A ``daemon.json`` naming this test process, so liveness checks pass without a real daemon."""
-    from herdr_team.cmd_board import now_iso
+    from herdr_team.cmd_board import now_iso, process_start_time
 
-    start = subprocess.run(["ps", "-o", "lstart=", "-p", str(os.getpid())], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, check=False).stdout.decode().strip()
+    # The same identity token the product writes: `ps -o lstart=` on unix, the
+    # process creation time on Windows. Shelling out to `ps` here broke every
+    # test that fakes a live daemon on Windows - `ps` does not exist there
+    # (2026-10-21 port fix).
+    start = process_start_time(os.getpid()) or ""
     store.write_json(ts.session.daemon_json, {"pid": os.getpid(), "start_time": start, "beat_at": now_iso(), "socket": os.fspath(ts.socket_path), "socket_inode": 1, "version": "0.1.0", "herdr_version": "0.8.2", "protocol": 20})
 
 
@@ -779,7 +784,10 @@ class Helpers(unittest.TestCase):
     def test_launcher_module_main_loads_commands(self):
         """``python -m herdr_team.cli`` imports cli twice; Command entries must satisfy ``__main__``'s isinstance."""
         root = Path(__file__).resolve().parent.parent
-        proc = subprocess.run([os.environ.get("PYTHON", "python3"), "-m", "herdr_team.cli", "--version"], cwd=os.fspath(root), stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, timeout=30, env=dict(os.environ, PYTHONPATH=os.fspath(root)))
+        # The interpreter running this test: `python3` does not exist on Windows
+        # (it resolves to the Microsoft Store stub, which exits 9009) (2026-10-21 port fix).
+        interpreter = os.environ.get("PYTHON") or sys.executable or "python3"
+        proc = subprocess.run([interpreter, "-m", "herdr_team.cli", "--version"], cwd=os.fspath(root), stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, timeout=30, env=dict(os.environ, PYTHONPATH=os.fspath(root)))
         self.assertEqual(proc.returncode, 0, proc.stderr.decode())
         self.assertIn(b"herdr-synapse", proc.stdout)
 

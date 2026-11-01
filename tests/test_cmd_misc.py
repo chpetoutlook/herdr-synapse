@@ -12,7 +12,7 @@ from unittest import mock
 
 from herdr_team import cli, paths, store
 from herdr_team import cmd_misc
-from support import FakeApi, FakeError, TempState, fake_agent, fake_read
+from support import fake_agent, fake_read, FakeApi, FakeError, symlink_or_skip, TempState
 
 
 def run_cli(argv, env, api=None):
@@ -31,7 +31,10 @@ def json_out(result):
 def write_live_daemon(ts):
     from herdr_team.cmd_board import now_iso
 
-    start = subprocess.run(["ps", "-o", "lstart=", "-p", str(os.getpid())], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, check=False).stdout.decode().strip()
+    # The identity token the product writes: `ps -o lstart=` on unix, the process creation time on Windows (`ps` does not exist there).
+    from herdr_team.cmd_board import process_start_time
+
+    start = process_start_time(os.getpid()) or ''
     store.write_json(ts.session.daemon_json, {"pid": os.getpid(), "start_time": start, "beat_at": now_iso(), "socket": os.fspath(ts.socket_path), "socket_inode": 1, "version": "0.1.0", "herdr_version": "0.8.2", "protocol": 20})
 
 
@@ -92,7 +95,8 @@ class DoctorTests(unittest.TestCase):
             self.assertIn("HERDR_TEAM_ALLOW_HERDR", payload["plugin"]["skipped"])
             self.assertEqual(payload["toast_delivery"], "terminal")
             self.assertFalse(payload["daemon"]["alive"])
-            self.assertEqual(payload["teams"], [{"team": "alpha", "members": 2, "missing": 0, "missions": 0, "missing_missions": ["alpha-reviewer", "alpha-worker"]}])
+            self.assertEqual(payload["teams"], [{"team": "alpha", "members": 2, "missing": 0, "missions": 0, "missing_missions": ["alpha-reviewer", "alpha-worker"],
+                                                "board": {"corrupt": 0, "fragments": 0, "duplicate_seqs": []}}])
             self.assertEqual(payload["console"], {"open": False, "pane_id": None, "lifecycle": None})
             self.assertEqual(payload["toast_probe"], {"probed": False, "shown": False, "reason": None})
             self.assertTrue(any("unreachable" in w for w in payload["warnings"]))
@@ -113,7 +117,7 @@ class DoctorTests(unittest.TestCase):
             self.assertEqual(payload["herdr"]["version"], "0.8.2")
             self.assertEqual(payload["herdr"]["protocol"], 20)
             self.assertEqual(payload["herdr"]["bin"], "/opt/fake/herdr")
-            self.assertTrue(payload["pointer"].endswith("plugins/config/herdr-synapse/state-dir"))
+            self.assertTrue(payload["pointer"].replace("\\", "/").endswith("plugins/config/herdr-synapse/state-dir"))
             self.assertTrue(payload["daemon"]["alive"])
             self.assertEqual(payload["daemon"]["pid"], os.getpid())
 
@@ -148,6 +152,39 @@ class DoctorTests(unittest.TestCase):
             layout = SimpleNamespace(config_dir=config, state_root=paths.StateRootResolution(ts.state_root, paths.STATE_SOURCE_XDG))
             self.assertIsNotNone(cmd_daemon._write_pointer(layout))
             self.assertEqual(paths.read_pointer(config), ts.state_root)
+
+    def test_doctor_names_a_board_no_reader_can_use(self):
+        """A record appended straight into board.jsonl is a record nobody heard.
+
+        It gets neither valid JSON nor a free seq, so every reader skips it and
+        the daemon's tailer drops it. The doctor says so by name, because the
+        failure is invisible to everyone but the log file.
+        """
+        with TempState() as ts:
+            api = FakeApi()
+            code, payload, err = json_out(run_cli(["--json", "doctor"], ts.env, api))
+            self.assertEqual(code, 0, err)
+            board = payload["teams"][0]["board"]
+            self.assertEqual((board["corrupt"], board["fragments"], board["duplicate_seqs"]),
+                             (0, 0, []))
+            self.assertFalse([w for w in payload["warnings"] if "board has" in w])
+
+            # Two hand-appended lines: one that is not JSON, one that reuses a seq.
+            seq = store.BoardStore(ts.team).append({"v": 1, "from": "someone", "to": ["all"],
+                                                     "kind": "note", "text": "a real record"})
+            with open(ts.team.board_jsonl, "ab") as fh:
+                fh.write(b'{"v":1,"seq":900,"origin":{"socket":"C:\\x\\y"},"text": broken}\n')
+                fh.write(b'{"v": 1, "seq": %d, "from": "hand", "to": ["all"], "kind": "note", "text": "same seq again"}\n' % seq)
+
+            code, payload, err = json_out(run_cli(["--json", "doctor"], ts.env, api))
+            self.assertEqual(code, 0, err)
+            board = payload["teams"][0]["board"]
+            self.assertEqual(board["corrupt"], 1)
+            self.assertEqual(board["duplicate_seqs"], [seq])
+            warning = [w for w in payload["warnings"] if "board has" in w]
+            self.assertEqual(len(warning), 1, payload["warnings"])
+            self.assertIn("never by writing board.jsonl directly", warning[0])
+            self.assertIn(str(seq), warning[0])
 
     def test_doctor_plugin_list_only_when_allowed(self):
         with TempState() as ts:
@@ -225,6 +262,35 @@ class InstallCli(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertTrue(payload["dry_run"])
             self.assertFalse(payload["created"])
+            if os.name == "nt":
+                # Windows has no symlink by default: the port installs a .cmd
+                # shim that calls the ported launcher (2026-10-21 port fix).
+                self.assertTrue(payload["path"].replace("\\", "/").endswith("bin/herdr-synapse.cmd"))
+                self.assertTrue(payload["target"].replace("\\", "/").endswith("bin/herdr-synapse.cmd"))
+                self.assertFalse((ts.home / ".local" / "bin" / "herdr-synapse.cmd").exists())
+                code, payload, _ = json_out(run_cli(["--json", "install-cli", "--yes"], ts.env))
+                self.assertTrue(payload["created"])
+                shim = ts.home / ".local" / "bin" / "herdr-synapse.cmd"
+                self.assertTrue(shim.is_file())
+                # The Windows shim RESOLVES the plugin root from herdr's own
+                # registry at run time - a baked-in path would break on the next
+                # reinstall - and then calls the root's own launcher. That is the
+                # Windows shape; the unix branch symlinks the launcher itself
+                # (asserted below).
+                body = shim.read_text(encoding="utf-8")
+                self.assertIn("plugin list --json", body)
+                self.assertIn("herdr-synapse.cmd", body)
+                self.assertNotIn(payload["target"], body)
+                code, payload, _ = json_out(run_cli(["--json", "install-cli", "--yes"], ts.env))
+                self.assertFalse(payload["created"])
+                self.assertFalse(payload["replaced"])
+                # A foreign file is never clobbered - the same rule the unix
+                # branch applies to a regular file at the link path.
+                shim.write_text("@echo off\r\nrem not ours\r\n", encoding="utf-8", newline="")
+                code, _, err = json_out(run_cli(["--json", "install-cli", "--yes"], ts.env))
+                self.assertEqual(code, 1)
+                self.assertEqual(err["code"], "path_exists")
+                return
             self.assertEqual(payload["path"], os.fspath(ts.home / ".local" / "bin" / "herdr-synapse"))
             self.assertTrue(payload["target"].endswith("bin/herdr-synapse"))
             self.assertFalse((ts.home / ".local" / "bin" / "herdr-synapse").exists())
@@ -237,7 +303,7 @@ class InstallCli(unittest.TestCase):
             self.assertFalse(payload["created"])
             self.assertFalse(payload["replaced"])
             os.unlink(link)
-            os.symlink("/bin/sh", link)
+            symlink_or_skip("/bin/sh", link)
             code, payload, _ = json_out(run_cli(["--json", "install-cli", "--yes"], ts.env))
             self.assertTrue(payload["replaced"])
             self.assertEqual(payload["existing"], "/bin/sh")
@@ -246,7 +312,11 @@ class InstallCli(unittest.TestCase):
         with TempState() as ts:
             target = ts.home / "bin"
             target.mkdir()
-            (target / "herdr-synapse").write_text("#!/bin/sh\n")
+            if os.name == "nt":
+                # The Windows shim is the file that must not be clobbered.
+                (target / "herdr-synapse.cmd").write_text("@echo off\r\n", encoding="utf-8", newline="")
+            else:
+                (target / "herdr-synapse").write_text("#!/bin/sh\n")
             code, _, err = json_out(run_cli(["--json", "install-cli", "--yes", "--dir", os.fspath(target)], ts.env))
             self.assertEqual(code, 1)
             self.assertEqual(err["code"], "path_exists")

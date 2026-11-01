@@ -58,6 +58,7 @@ from herdr_team import identity as _identity
 from herdr_team import store
 from herdr_team.errors import EXIT_REFUSED, EXIT_USAGE, HerdrTeamError
 from herdr_team.paths import Layout, TeamPaths
+from herdr_team.platform_compat import IS_WINDOWS, detached_creation_flags, kill_process_group
 
 SCHEMA = 1
 DEFINITIONS_FILE = "schedules.json"
@@ -752,23 +753,38 @@ def precheck_cwd(layout: Layout, team_name: str) -> str:
 
 
 def run_precheck(command: str, cwd: str, env: Dict[str, str], timeout_s: float) -> PrecheckResult:
-    """``/bin/sh -c command`` with a deadline; on timeout its whole process group is killed.
+    """A shell command with a deadline; on timeout its whole process group is killed.
 
     ``start_new_session`` puts the shell and anything it starts in one group,
     so a timed-out ``curl`` or ``sleep`` under the shell dies with it instead of
-    outliving the check.
+    outliving the check. Windows has no ``/bin/sh``: the command runs under
+    ``%COMSPEC%`` (``cmd.exe /c``) and the tree is killed with ``taskkill /T``.
     """
     started = time.monotonic()
+    if IS_WINDOWS:
+        shell = env.get("COMSPEC") or os.environ.get("COMSPEC") or "cmd.exe"
+        argv = [shell, "/c", command]
+    else:
+        argv = ["/bin/sh", "-c", command]
     try:
-        proc = subprocess.Popen(["/bin/sh", "-c", command], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                start_new_session=not IS_WINDOWS,
+                                creationflags=detached_creation_flags() if IS_WINDOWS else 0)
     except OSError as err:
-        return PrecheckResult("error", None, "cannot start /bin/sh: {}".format(err), time.monotonic() - started)
+        return PrecheckResult("error", None, "cannot start {}: {}".format(argv[0], err), time.monotonic() - started)
     try:
         out, _ = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
+        # The signal is resolved INSIDE the branch that uses it: Windows has no
+        # SIGKILL (it is SIGTERM), and evaluating ``signal.SIGKILL`` on
+        # Windows raises AttributeError - which is not an OSError, so the
+        # fallback below would not catch it and the timeout path would fail
+        # with a traceback instead of reporting the timeout (measured
+        # 2026-10-22, W-42).
+        kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            kill_process_group(proc.pid, kill_signal)
         except OSError:
             proc.kill()
         out, _ = proc.communicate()

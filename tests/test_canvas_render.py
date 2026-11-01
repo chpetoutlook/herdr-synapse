@@ -20,6 +20,7 @@ from herdr_team import canvas_render as R
 from herdr_team import canvas_svg as S
 from herdr_team import canvas_theme as T
 from herdr_team.errors import HerdrTeamError
+from support import assert_mode
 
 SVG = "http://www.w3.org/2000/svg"
 
@@ -289,7 +290,7 @@ class RenderPng(unittest.TestCase):
         self.assertEqual(argv[:3], ["/fake/resvg", "-w", "64"])
         self.assertTrue(argv[-2].endswith(".svg") and argv[-1].endswith("a.png"))
         self.assertEqual(timeout, R.RENDER_TIMEOUT_S)
-        self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o600)
+        assert_mode(out, 0o600)
         self.assertEqual([p.name for p in self.tmp.iterdir()], ["a.png"], "the temporary svg is removed")
 
     def test_missing_or_failing_resvg_is_none_never_an_exception(self):

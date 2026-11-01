@@ -199,8 +199,9 @@ def run_args(args: argparse.Namespace) -> int:
 
     env = dict(args.env)
     layout = _cli.layout_for(args)
-    if env.get("HERDR_PLUGIN_ENTRYPOINT_ID") != ENTRYPOINT and not getattr(args, "force", False):
+    if not _paths.entrypoint_matches(env, ENTRYPOINT) and not getattr(args, "force", False):
         raise HerdrTeamError("not_a_plugin_pane", "compose runs in the post popup; use `herdr-synapse ui compose` or pass --force", EXIT_REFUSED)
+    _paths.require_vendor_curses(env)
     if not _paths.socket_allowed(layout.config_dir, layout.socket):
         # Plan 4.1 / PK-07: an unlisted socket makes the pane a no-op before any socket call.
         sys.stderr.write("herdr-synapse compose skipped: socket not allowed\n")

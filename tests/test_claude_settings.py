@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 
 from herdr_team import claude_settings as cs
 from herdr_team.errors import HerdrTeamError
+from support import assert_mode, platform_path, symlink_or_skip
 
 # Herdr's own installer (src/integration/claude_settings.rs) writes exactly this
 # entry object for SessionStart: matcher "*", one command hook, timeout 10, the
@@ -98,9 +99,16 @@ class SettingsCase(unittest.TestCase):
 
 class EntryShapeTests(SettingsCase):
     def test_command_string_matches_herdr_quoting(self):
-        path = Path("/Users/some one/.claude/hooks/herdr-synapse-hook.sh")
-        self.assertEqual(cs.hook_command(path, "SessionStart"), "bash '/Users/some one/.claude/hooks/herdr-synapse-hook.sh' session-start")
-        self.assertEqual(cs.hook_command(Path("/a'b/h.sh"), "Stop"), "bash '/a'\"'\"'b/h.sh' stop")
+        # The path is built in THIS platform's shape: a POSIX path is
+        # drive-relative on Windows and comes back with backslashes, so the
+        # assertion would be about the shape of the platform and not about the
+        # quoting (2026-10-21 port fix, W-22).
+        path = platform_path("Users", "some one", ".claude", "hooks", "herdr-synapse-hook.sh")
+        self.assertEqual(cs.hook_command(path, "SessionStart"), "bash '{}' session-start".format(path))
+        # a single quote inside the value is closed, escaped and reopened
+        quoted = platform_path("a'b", "h.sh")
+        self.assertEqual(cs.hook_command(quoted, "Stop"),
+                         "bash '" + os.fspath(quoted).replace("'", "'\"'\"'") + "' stop")
         self.assertEqual(cs.shell_single_quote(HERDR_HOOK_PATH), "'" + HERDR_HOOK_PATH + "'")
 
     def test_entries_are_separate_objects_with_plan_timeouts(self):
@@ -270,14 +278,14 @@ class RoundTripTests(SettingsCase):
         result = cs.install(self.settings, self.hook)
         self.assertIsNone(result["backup"])
         self.assertEqual(set(self.load()["hooks"]), {"SessionStart", "UserPromptSubmit", "Stop"})
-        mode = stat.S_IMODE(os.stat(self.settings).st_mode)
-        self.assertEqual(mode, 0o600)
+        mode = stat.S_IMODE(os.stat(self.settings).st_mode)  # the mode bits are a unix fact (see assert_mode)
+        assert_mode(self.settings, 0o600)
 
     def test_existing_mode_is_kept(self):
         self.write("{}\n")
         os.chmod(self.settings, 0o644)
         cs.install(self.settings, self.hook)
-        self.assertEqual(stat.S_IMODE(os.stat(self.settings).st_mode), 0o644)
+        assert_mode(self.settings, 0o644)
 
     def test_uninstall_removes_only_our_command_from_a_shared_entry(self):
         shared = {
@@ -307,7 +315,7 @@ class RoundTripTests(SettingsCase):
         real = self.tmp / "dotfiles" / "claude-settings.json"
         real.parent.mkdir(parents=True)
         real.write_text("{}\n", encoding="utf-8")
-        os.symlink(os.fspath(real), os.fspath(self.settings))
+        symlink_or_skip(os.fspath(real), os.fspath(self.settings))
         cs.install(self.settings, self.hook)
         self.assertTrue(self.settings.is_symlink())
         self.assertIn("UserPromptSubmit", json.loads(real.read_text(encoding="utf-8"))["hooks"])
@@ -369,25 +377,28 @@ class CheckAndScanTests(SettingsCase):
 
 class ShimFileTests(SettingsCase):
     def test_render_bakes_cli_path_and_keeps_marker(self):
-        text = cs.render_shim(Path("/opt/x y/bin/herdr-synapse"))
-        self.assertIn("HERDR_TEAM_CLI='/opt/x y/bin/herdr-synapse'", text)
+        cli = platform_path("opt", "x y", "bin", "herdr-synapse")
+        text = cs.render_shim(cli)
+        self.assertIn("HERDR_TEAM_CLI='{}'".format(cli), text)
         self.assertNotIn(cs.CLI_PLACEHOLDER, text)
         self.assertIn(cs.SHIM_MARKER + str(cs.SHIM_VERSION), text)
         self.assertTrue(text.startswith("#!/bin/sh\n"))
 
     def test_write_shim_mode_and_foreign_refusal(self):
         hooks_dir = self.claude_dir / "hooks"
-        target = cs.write_shim(hooks_dir, Path("/opt/herdr-synapse"))
+        cli = platform_path("opt", "herdr-synapse")
+        other = platform_path("opt", "other", "herdr-synapse")
+        target = cs.write_shim(hooks_dir, cli)
         self.assertEqual(target, hooks_dir / cs.HOOK_FILE_NAME)
-        self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o700)
+        assert_mode(target, 0o700)
         self.assertTrue(cs.shim_is_ours(target))
         # rewrite is fine for our own file
-        cs.write_shim(hooks_dir, Path("/opt/other/herdr-synapse"))
-        self.assertIn("/opt/other/herdr-synapse", target.read_text(encoding="utf-8"))
+        cs.write_shim(hooks_dir, other)
+        self.assertIn(os.fspath(other), target.read_text(encoding="utf-8"))
         # a foreign file with the same name is never overwritten or removed
         target.write_text("#!/bin/sh\necho mine\n", encoding="utf-8")
         with self.assertRaises(HerdrTeamError) as ctx:
-            cs.write_shim(hooks_dir, Path("/opt/herdr-synapse"))
+            cs.write_shim(hooks_dir, cli)
         self.assertEqual(ctx.exception.code, "hook_file_foreign")
         self.assertFalse(cs.remove_shim(hooks_dir))
         self.assertTrue(target.exists())

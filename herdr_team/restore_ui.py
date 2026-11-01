@@ -5,6 +5,8 @@ import json
 import os
 import subprocess
 import tempfile
+
+from herdr_team import platform_compat as _compat
 from typing import Any, Dict, Optional
 
 from herdr_team.console import cli_path
@@ -31,7 +33,7 @@ class RestoreProcess:
 
     def progress(self) -> str:
         size = os.fstat(self.errors.fileno()).st_size
-        tail = os.pread(self.errors.fileno(), min(size, 4096), max(0, size - 4096)).decode("utf-8", "replace").strip()
+        tail = _compat.read_at(self.errors.fileno(), min(size, 4096), max(0, size - 4096)).decode("utf-8", "replace").strip()
         return tail.splitlines()[-1] if tail else "restoring {}…".format(self.team)
 
     def result(self) -> Optional[Dict[str, Any]]:

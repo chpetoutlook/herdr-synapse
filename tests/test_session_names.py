@@ -33,9 +33,14 @@ class SessionNameTests(unittest.TestCase):
         self.assertEqual(names.prepare("codex", self.name, ["--yolo"])[0], ["--yolo"])
 
     def test_opencode_uses_managed_loopback_tui(self):
+        # OpenCode v2.1+ starts its own server on a random port and rejects the
+        # --hostname/--port flags, so the launcher passes none and records the
+        # port it picked for the session record instead.
         argv, entry = names.prepare("opencode", self.name, [])
-        self.assertEqual(argv[:3], ["--hostname", "127.0.0.1", "--port"])
-        self.assertEqual(int(argv[3]), entry["port"])
+        self.assertEqual(argv, [])
+        self.assertNotIn("--hostname", argv)
+        self.assertNotIn("--port", argv)
+        self.assertTrue(1 <= int(entry["port"]) <= 65535)
         self.assertNotIn("run", argv)
 
     def test_codex_rename_runs_once_before_brief(self):

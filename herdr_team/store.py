@@ -24,7 +24,6 @@ when the holder dies. The daemon must close inherited fds *before* taking
 from __future__ import annotations
 
 import errno
-import fcntl
 import hashlib
 import itertools
 import json
@@ -40,7 +39,14 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from herdr_team.errors import EXIT_REFUSED, HerdrTeamError, LockTimeout
+from herdr_team import platform_compat as _compat
 from herdr_team.paths import DIR_MODE, FILE_MODE, SessionPaths, TeamPaths, check_not_symlink, ensure_dir, ensure_team_dirs
+
+try:  # POSIX advisory locking.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+    import msvcrt  # type: ignore[import-not-found]
 
 PathLike = Union[str, "os.PathLike[str]"]
 
@@ -54,9 +60,26 @@ CLAUDE_SETTINGS_LOCK_SUFFIX = ".herdr-team.lock"
 
 
 def secure_open(path: PathLike, flags: int, mode: int = FILE_MODE) -> int:
-    """``os.open`` with ``O_NOFOLLOW|O_CLOEXEC`` after an lstat symlink check."""
+    """``os.open`` with ``O_NOFOLLOW|O_CLOEXEC`` after an lstat symlink check.
+
+    Windows has neither flag (``O_CLOEXEC`` is implicit there, and there is
+    no ``O_NOFOLLOW``), so the flags are added only on POSIX.
+
+    Windows opens in TEXT mode by default, and a text-mode ``os.write``
+    translates ``\\n`` into ``\\r\\n`` - which changes the byte format of the
+    board, the JSONL logs and the audit trail (the unix files are LF). The
+    binary flag is therefore required there (2026-10-21 port fix).
+    """
     check_not_symlink(path)
-    flags |= os.O_NOFOLLOW | os.O_CLOEXEC
+    if fcntl is not None:
+        flags |= os.O_NOFOLLOW | os.O_CLOEXEC
+    elif os.name == "nt":
+        flags |= getattr(os, "O_BINARY", 0)
+        # Windows refuses to rename over a file another handle has open, unless
+        # that handle was opened with FILE_SHARE_DELETE. The board is held
+        # open by the tailer, so the rotation's rename failed with WinError 32
+        # and a write lost a post (2026-10-21 port fix, W-16).
+        return _compat.open_file(os.fspath(path), flags, mode)
     try:
         return os.open(path, flags, mode)
     except OSError as err:
@@ -65,15 +88,53 @@ def secure_open(path: PathLike, flags: int, mode: int = FILE_MODE) -> int:
         raise
 
 
+def _fchmod(fd: int, mode: int) -> None:
+    """``os.fchmod`` where it exists; Windows has no POSIX mode bits."""
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is None:
+        return
+    try:
+        fchmod(fd, mode)
+    except OSError:
+        pass
+
+
+def _read_at(fd: int, size: int, offset: int) -> bytes:
+    """Read ``size`` bytes at ``offset`` without moving the write cursor.
+
+    POSIX uses ``os.pread``; Windows has no ``pread``, so the read pointer
+    is moved and restored (``O_APPEND`` keeps every write at the tail
+    anyway).
+    """
+    return _compat.read_at(fd, size, offset)
+
+
+#: How many times a rename is retried, and how long it waits between tries.
+#: Windows refuses to rename over a file that another handle has open
+#: (ERROR_SHARING_VIOLATION, WinError 5), and the board is read by a tailer
+#: that holds the file open for the length of a read. The handle is short
+#: lived, so a bounded retry turns a LOST post into a slow write. Measured on
+#: 2026-10-21: the board write failed with WinError 5 and the post was gone.
+RENAME_ATTEMPTS = 20
+RENAME_RETRY_S = 0.05
+
+
 def atomic_write(path: PathLike, data: bytes, mode: int = FILE_MODE, fsync: bool = True) -> None:
-    """Write ``data`` to a temp file in the target directory, fsync, rename."""
+    """Write ``data`` to a temp file in the target directory, fsync, rename.
+
+    The rename is retried while it is refused because the target is open
+    (Windows), and a rename that still fails is reported as the rename
+    failing - by name - instead of as the server being unreachable: a lost
+    post is a lost instruction, and the old answer named the wrong cause
+    (2026-10-21 port fix, W-16).
+    """
     target = Path(path)
     check_not_symlink(target)
     ensure_dir(target.parent)
     fd, tmp_name = tempfile.mkstemp(prefix=".tmp-" + target.name + "-", dir=os.fspath(target.parent))
     try:
         try:
-            os.fchmod(fd, mode)
+            _fchmod(fd, mode)
             view = memoryview(data)
             while len(view):
                 written = os.write(fd, view)
@@ -82,7 +143,19 @@ def atomic_write(path: PathLike, data: bytes, mode: int = FILE_MODE, fsync: bool
                 os.fsync(fd)
         finally:
             os.close(fd)
-        os.replace(tmp_name, target)
+        for attempt in range(RENAME_ATTEMPTS):
+            try:
+                os.replace(tmp_name, target)
+                break
+            except PermissionError as err:
+                if attempt == RENAME_ATTEMPTS - 1:
+                    raise HerdrTeamError(
+                        "write_failed",
+                        "the atomic rename of {0} failed: {1}".format(target.name, err),
+                        EXIT_REFUSED,
+                        {"path": os.fspath(target), "operation": "rename"},
+                    )
+                time.sleep(RENAME_RETRY_S)
     except BaseException:
         try:
             os.unlink(tmp_name)
@@ -140,7 +213,7 @@ def append_line(path: PathLike, line: bytes, mode: int = FILE_MODE, fsync: bool 
         size = os.fstat(fd).st_size
         prefix = b""
         if size > 0:
-            last = os.pread(fd, 1, size - 1)
+            last = _read_at(fd, 1, size - 1)
             if last != b"\n":
                 prefix = b"\n"
         payload = prefix + line
@@ -159,7 +232,12 @@ def append_line(path: PathLike, line: bytes, mode: int = FILE_MODE, fsync: bool 
 
 
 class FileLock:
-    """One ``flock``-ed file. Use as a context manager or ``acquire``/``release``."""
+    """One ``flock``-ed file. Use as a context manager or ``acquire``/``release``.
+
+    POSIX uses ``fcntl.flock``. Windows has no ``flock``, so the lock is one
+    byte range (``msvcrt.locking``); the kernel releases it when the handle
+    closes, so the same "the holder died" semantics hold.
+    """
 
     def __init__(self, path: PathLike, timeout: float = TEAM_LOCK_TIMEOUT_S, code: str = "lock_timeout") -> None:
         self.path = Path(path)
@@ -171,6 +249,35 @@ class FileLock:
     def held(self) -> bool:
         return self.fd is not None
 
+    def _try_lock(self, fd: int) -> bool:
+        """One non-blocking lock attempt; True when the lock was taken."""
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError as err:
+                if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    raise
+                return False
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError as err:
+            if err.errno not in (errno.EACCES, errno.EDEADLK, errno.EAGAIN):
+                raise
+            return False
+
+    def _unlock(self, fd: int) -> None:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+
     def acquire(self, timeout: Optional[float] = None) -> "FileLock":
         if self.fd is not None:
             return self
@@ -180,12 +287,8 @@ class FileLock:
         deadline = time.monotonic() + wait
         try:
             while True:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if self._try_lock(fd):
                     break
-                except OSError as err:
-                    if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
-                        raise
                 if time.monotonic() >= deadline:
                     raise LockTimeout(os.fspath(self.path), wait, self.code)
                 time.sleep(LOCK_POLL_S)
@@ -209,7 +312,7 @@ class FileLock:
             return
         self.fd = None
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            self._unlock(fd)
         finally:
             os.close(fd)
 
@@ -279,8 +382,19 @@ SYSTEM_EVENTS = (
     "board_cleared",
     # 0.19: work items, facts, schedules
     "work_ready", "work_cancelled",
+    # 0.23: the daemon's own work nudge. ``work_review`` wakes the named reviewer of a
+    # settled item; ``manager_nudge`` wakes the manager whose queue needs judgement.
+    # Both report, neither assigns: the manager still decides who gets what.
+    "work_review", "manager_nudge",
+    # 0.23: the pending digest for the team's lead -- every item that cannot move on
+    # its own, with the command that moves it. Reports and wakes; the lead decides.
+    "leader_pending",
+    # 0.23: the manager's periodic sweep (idle seats, unowned work, verdicts, asks)
+    # and the idle seat's own nudge (drive your work, do not wait to be asked).
+    "manager_sweep", "idle_agent",
     "fact_added", "fact_retired", "fact_disputed", "fact_conflict", "fact_resolved", "contradictions_changed",
     "schedule_failed", "schedule_missed",
+    "superuser_designated", "superuser_revoked",
     # 0.20: a member's harness profile
     "profile_changed",
     # 0.21: the whiteboard (``features``, ``canvas``): coalesced drawing awareness, a named
@@ -696,9 +810,9 @@ class BoardStore:
             size = os.fstat(fd).st_size
             if size == 0:
                 return 0, 0, 0
-            head = os.pread(fd, min(size, TAIL_SCAN_BYTES), 0)
+            head = _read_at(fd, min(size, TAIL_SCAN_BYTES), 0)
             start = max(0, size - TAIL_SCAN_BYTES)
-            tail = head if start == 0 else os.pread(fd, size - start, start)
+            tail = head if start == 0 else _read_at(fd, size - start, start)
         finally:
             os.close(fd)
         first_seq = 0
@@ -793,7 +907,7 @@ class BoardStore:
         try:
             size = os.fstat(fd).st_size
             payload = line
-            if size > 0 and os.pread(fd, 1, size - 1) != b"\n":
+            if size > 0 and _read_at(fd, 1, size - 1) != b"\n":
                 payload = b"\n" + line
             try:
                 written = _os_write(fd, payload)
@@ -1158,7 +1272,7 @@ class BoardStore:
             )
         ensure_dir(self.team.payloads_dir)
         tmp = self.team.payloads_dir / "{}{}-{}".format(STAGING_PREFIX, os.getpid(), next(self._staging_counter))
-        src_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        src_fd = os.open(source, os.O_RDONLY | _compat.nofollow_flags())
         try:
             dst_fd = secure_open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, FILE_MODE)
             try:
@@ -1202,6 +1316,18 @@ class BoardStore:
                 attempt += 1
                 if attempt > 99:
                     raise HerdrTeamError("board_write_failed", "could not place attachment", EXIT_REFUSED, {"path": os.fspath(target)})
+            except OSError:
+                # Windows refuses hard links on some volumes; a rename into
+                # place is the same exclusive placement there.
+                try:
+                    os.replace(staged.tmp_path, target)
+                    staged.committed = "payloads/" + name
+                    return target
+                except FileExistsError:
+                    attempt += 1
+                    continue
+                except OSError as err:
+                    raise HerdrTeamError("board_write_failed", "could not place attachment: {}".format(err), EXIT_REFUSED, {"path": os.fspath(target)})
         try:
             os.unlink(staged.tmp_path)
         except OSError:
@@ -1557,7 +1683,7 @@ class BoardTailer:
 
     @staticmethod
     def _boundary_ok(fd: int, offset: int) -> bool:
-        return offset == 0 or os.pread(fd, 1, offset - 1) == b"\n"
+        return offset == 0 or _read_at(fd, 1, offset - 1) == b"\n"
 
     def _archive_explains(self, seq: int) -> bool:
         for seg in self.board.archive_segments():
@@ -1581,7 +1707,7 @@ class BoardTailer:
         chunks: List[bytes] = []
         pos = self.offset
         while True:
-            chunk = os.pread(self.fd, 1 << 20, pos)
+            chunk = _read_at(self.fd, 1 << 20, pos)
             if not chunk:
                 break
             chunks.append(chunk)

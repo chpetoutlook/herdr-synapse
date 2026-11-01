@@ -23,7 +23,7 @@ from unittest import mock
 
 from herdr_team import claude_settings as cs
 from herdr_team import cli, cmd_hooks, store
-from support import PLUGIN_ROOT, FakeHerdrServer, TempState
+from support import assert_mode, FakeHerdrServer, PLUGIN_ROOT, requires_posix, requires_posix_sh, TempState
 
 SHIM_SOURCE = PLUGIN_ROOT / "hooks" / "claude" / cs.HOOK_FILE_NAME
 
@@ -53,6 +53,13 @@ def post(team, sender: str, to: List[str], text: str, kind: str = "request", fro
 
 class ShimCase(unittest.TestCase):
     def setUp(self) -> None:
+        # The Claude hook shim is a /bin/sh script with the CLI path baked in,
+        # and the port keeps it exactly as upstream wrote it. Windows cannot
+        # execute it, and a machine without sh on PATH cannot either - so the
+        # tests that RUN the shim skip with that reason, and the unix run
+        # still exercises them (2026-10-21 port fix, W-22).
+        requires_posix_sh("this test runs the Claude hook shim under a POSIX sh: "
+                          "the shim is a /bin/sh script and this machine has no sh")
         self.ts = TempState()
         self.addCleanup(self.ts.cleanup)
         self.tmp = Path(tempfile.mkdtemp(prefix="ht-shim-"))
@@ -153,6 +160,7 @@ class ShimSourceTests(unittest.TestCase):
                 self.assertTrue(line.rstrip().endswith("|| true") or "=$(" in line, line)
 
     def test_shim_parses_under_sh(self):
+        requires_posix_sh("the Claude hook shim is a /bin/sh script: this machine has no sh to parse it under")
         proc = subprocess.run(["sh", "-n", os.fspath(SHIM_SOURCE)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
@@ -235,6 +243,10 @@ class BrokenEnvironmentTests(ShimCase):
         self.assertTrue(self.sentinel.exists())
 
     def test_read_only_hooks_dir_and_log(self):
+        # A read-only directory is a POSIX shape: Windows has no POSIX mode
+        # bits (chmod only toggles the read-only flag), so a directory cannot
+        # be made unwritable there (2026-10-21 port fix, W-22).
+        requires_posix("a read-only directory needs POSIX mode bits: Windows cannot make a directory unwritable")
         ro = self.tmp / "ro"
         ro.mkdir()
         shim = self.write_shim("/nonexistent/herdr-synapse", directory=ro)
@@ -578,7 +590,7 @@ class HooksCommandTests(unittest.TestCase):
         shim = Path(payload["hook"])
         self.assertTrue(shim.is_file())
         self.assertIn("HERDR_TEAM_CLI='{}'".format(self.cli_path), shim.read_text(encoding="utf-8"))
-        self.assertEqual(stat.S_IMODE(os.stat(shim).st_mode), 0o700)
+        assert_mode(shim, 0o700)
         doc = store.read_json(self.ts.team.team_json)
         by_name = {m["name"]: m for m in doc["members"]}
         self.assertEqual(by_name["alpha-worker"]["delivery"], "hooks")

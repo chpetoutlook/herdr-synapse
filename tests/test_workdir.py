@@ -20,7 +20,7 @@ from herdr_team import cmd_hooks, roster, store, workdir
 from herdr_team import document_sync as _sync
 from herdr_team.errors import HerdrTeamError
 from herdr_team.identity import Author
-from support import TempState
+from support import is_root, symlink_or_skip, TempState
 
 
 def human(name: str = "human") -> Author:
@@ -126,7 +126,7 @@ class IsInsideTests(unittest.TestCase):
         shared = self.tmp / workdir.DIR_NAME
         shared.mkdir()
         try:
-            os.symlink(secrets, shared / "escape")
+            symlink_or_skip(secrets, shared / "escape")
         except (OSError, NotImplementedError):
             self.skipTest("symlinks unavailable")
         # The lexical path looks inside .herdr-team/; the resolved one does not.
@@ -301,8 +301,14 @@ class RenderTests(unittest.TestCase):
 
     def test_a_read_only_project_is_reported_not_fatal(self):
         self.set_project()
-        if os.getuid() == 0:
+        if is_root():
             self.skipTest("root ignores the mode bits")
+        if os.name == "nt":
+            # Windows has no POSIX mode bits for a DIRECTORY: chmod 0o500 does
+            # not make it unwritable, so there is no read-only project to
+            # report. The product's behaviour there is "nothing to report"
+            # (2026-10-21 port fix, W-9).
+            self.skipTest("a directory cannot be made unwritable on Windows (no POSIX mode bits)")
         os.chmod(self.project, 0o500)
         self.addCleanup(lambda: os.chmod(self.project, 0o700))
         result = workdir.render(self.layout, self.team)
@@ -620,8 +626,13 @@ class DoctorTests(unittest.TestCase):
     def test_a_read_only_project_is_reported(self):
         from herdr_team import cmd_misc
 
-        if os.getuid() == 0:
+        if is_root():
             self.skipTest("root ignores the mode bits")
+        if os.name == "nt":
+            # Windows has no POSIX mode bits for a DIRECTORY: chmod 0o500 does
+            # not make it unwritable, so the product has nothing to report
+            # (2026-10-21 port fix, W-9).
+            self.skipTest("a directory cannot be made unwritable on Windows (no POSIX mode bits)")
         self.set_project(self.project)
         os.chmod(self.project, 0o500)
         self.addCleanup(lambda: os.chmod(self.project, 0o700))
@@ -733,7 +744,10 @@ class ArtifactWatchTests(unittest.TestCase):
         (art / "sub" / "deep.md").write_text("x", encoding="utf-8")
         (art / ".hidden").write_text("x", encoding="utf-8")
         seen = workdir.fingerprint_artifacts(os.fspath(self.project), "alpha")
-        self.assertIn(os.path.join("sub", "deep.md"), seen)
+        # The artifact keys are PORTABLE relative paths (forward slashes on
+        # every platform), so a Windows run must not build the expectation with
+        # os.path.join - asserted, not skipped (2026-10-21 port fix, W-9).
+        self.assertIn("sub/deep.md", seen)
         self.assertNotIn(".hidden", seen)
 
     def test_the_walk_is_bounded(self):
@@ -2238,6 +2252,13 @@ class CanvasMirrorTests(unittest.TestCase):
         """
         import hashlib
         from unittest import mock
+
+        if os.name == "nt":
+            # The failing copy is made by chmod-ing the asset folder to 0o500, and
+            # Windows has no POSIX mode bits for a DIRECTORY - the copy simply
+            # succeeds, so there is no failing copy to exercise (2026-10-21 port
+            # fix, W-9).
+            self.skipTest("a directory cannot be made unwritable on Windows (no POSIX mode bits)")
 
         from herdr_team import canvas as C
 

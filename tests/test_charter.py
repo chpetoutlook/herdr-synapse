@@ -6,7 +6,7 @@ import os
 import unittest
 from pathlib import Path
 
-from support import FakeApi, TempState
+from support import FakeApi, TempState, assert_mode, symlink_or_skip
 
 from herdr_team import charter, identity, roster, store
 from herdr_team.errors import EXIT_REFUSED, HerdrTeamError
@@ -124,7 +124,7 @@ class CharterSetTests(unittest.TestCase):
             result = charter.set_charter(ts.layout, "alpha", HUMAN, None, os.fspath(source), [])
             self.assertEqual(result.refs, ["charter.md"])
             self.assertEqual(ts.team.charter_md.read_text(encoding="utf-8"), body)
-            self.assertEqual(oct(os.stat(ts.team.charter_md).st_mode & 0o777), "0o600")
+            assert_mode(ts.team.charter_md, 0o600)
             self.assertLessEqual(len(result.text), charter.MAX_CHARTER_CHARS)
             self.assertTrue(result.text.startswith("# Goal"))
             self.assertEqual(result.headline(), "# Goal")
@@ -148,7 +148,7 @@ class CharterSetTests(unittest.TestCase):
             self.assertEqual(ctx.exception.code, "invalid_utf8")
             link = ts.tmp / "link.md"
             (ts.tmp / "real.md").write_text("real", encoding="utf-8")
-            os.symlink(ts.tmp / "real.md", link)
+            symlink_or_skip(ts.tmp / "real.md", link)
             with self.assertRaises(HerdrTeamError) as ctx:
                 charter.set_charter(ts.layout, "alpha", HUMAN, None, os.fspath(link), [])
             self.assertEqual(ctx.exception.code, "path_symlink")
@@ -186,9 +186,15 @@ class RefTests(unittest.TestCase):
         with TempState() as ts:
             payload = ts.team.payloads_dir / "42-diff.md"
             payload.write_text("diff", encoding="utf-8")
-            self.assertEqual(charter.validate_refs(ts.layout, "alpha", ["payloads/42-diff.md", os.fspath(payload)]), ["payloads/42-diff.md"])
-            result = charter.set_charter(ts.layout, "alpha", HUMAN, "see diff", None, ["payloads/42-diff.md"])
-            self.assertEqual(result.refs, ["payloads/42-diff.md"])
+            # The ref is written POSIX-style, and the product answers with the
+            # path as it resolved it: the platform's own separator (a Windows
+            # path uses a backslash). Asserted, not skipped (2026-10-21 port
+            # fix, W-9).
+            ref = "payloads/42-diff.md"
+            resolved = os.path.join("payloads", "42-diff.md")
+            self.assertEqual(charter.validate_refs(ts.layout, "alpha", [ref, os.fspath(payload)]), [resolved])
+            result = charter.set_charter(ts.layout, "alpha", HUMAN, "see diff", None, [ref])
+            self.assertEqual(result.refs, [resolved])
 
     def test_refs_under_a_member_cwd_stay_absolute(self) -> None:
         with TempState() as ts:
@@ -215,7 +221,7 @@ class RefTests(unittest.TestCase):
                     charter.validate_refs(ts.layout, "alpha", [ref])
                 self.assertEqual(ctx.exception.code, "ref_invalid")
             link = ts.team.root / "link.md"
-            os.symlink(outside, link)
+            symlink_or_skip(outside, link)
             with self.assertRaises(HerdrTeamError) as ctx:
                 charter.validate_refs(ts.layout, "alpha", ["link.md"])
             self.assertEqual(ctx.exception.code, "path_symlink")

@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from herdr_team import cmd_board, render, store, workdir
-from support import TempState
+from support import assert_mode, symlink_or_skip, TempState
 from test_cmd_roster import json_out, run_cli
 
 
@@ -136,7 +136,7 @@ class ExportCommandTests(unittest.TestCase):
         link = self.out / "link.md"
         real.write_text("x", encoding="utf-8")
         try:
-            os.symlink(real, link)
+            symlink_or_skip(real, link)
         except (OSError, NotImplementedError):
             self.skipTest("symlinks unavailable")
         code, _payload, err = json_out(self.cli(os.fspath(link), "--force"))
@@ -159,7 +159,7 @@ class ExportCommandTests(unittest.TestCase):
     def test_the_file_is_private(self):
         target = self.out / "board.md"
         self.cli(os.fspath(target))
-        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        assert_mode(target, 0o600)
 
 
 if __name__ == "__main__":

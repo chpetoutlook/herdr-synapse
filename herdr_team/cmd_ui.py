@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from herdr_team import PLUGIN_ID, compose, console, picker
+from herdr_team import paths as _paths
+from herdr_team import platform_compat as _compat
 from herdr_team.api import plugin_pane_id
 from herdr_team.cli import Command, api_for, emit, layout_for
 from herdr_team.errors import HerdrTeamError
@@ -52,6 +54,8 @@ def _add_ui_arguments(parser: argparse.ArgumentParser) -> None:
 def open_params(target: str, target_pane: Optional[str], env: Dict[str, str], team: Optional[str]) -> Dict[str, Any]:
     """``plugin.pane.open`` params for ``target`` (the manifest fixes placement and size)."""
     entrypoint = "console" if target == "who" else target
+    # Windows has its own manifest entrypoint ids (``picker-windows``).
+    entrypoint = _paths.entrypoint_id(entrypoint)
     pane_env: Dict[str, str] = {}
     if team:
         pane_env["HERDR_TEAM"] = team
@@ -171,7 +175,9 @@ def label_console_pane(api: Any, pane_id: Any, team: Optional[str]) -> None:
         pass
 #: After ``plugin.pane.open`` of the console entrypoint, ``reconcile_console`` leaves labelled shells alone this long.
 CONSOLE_LAUNCH_GRACE_S = 15.0
-SHELL_NAMES =frozenset({"sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "-sh", "-bash", "-zsh", "-fish", "login"})
+SHELL_NAMES = frozenset({"sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "-sh", "-bash", "-zsh", "-fish", "login",
+                          # Windows shells
+                          "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe", "-cmd", "-powershell"})
 
 
 def _pane_list(api: Any) -> List[Dict[str, Any]]:
@@ -190,15 +196,8 @@ def _pid_alive(pid: Any) -> bool:
         return False
     if pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+    # Windows note: ``os.kill(pid, 0)`` would terminate the process there.
+    return _compat.pid_alive(pid)
 
 
 def find_console_pane(api: Any, console_json: Dict[str, Any], panes: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
@@ -399,7 +398,6 @@ def reconcile_console(layout: Any, api: Any, env: Dict[str, str], reopen: bool =
 
 def _run_ui(args: argparse.Namespace) -> int:
     layout = layout_for(args)
-    from herdr_team import paths as _paths
 
     if not _paths.socket_allowed(layout.config_dir, layout.socket):
         # Plan 4.1 / PK-07: manifest actions and panes are no-ops for a socket the rig has not listed.

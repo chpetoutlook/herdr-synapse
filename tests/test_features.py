@@ -7,11 +7,12 @@ import stat
 import unittest
 
 from herdr_team import features as F
+from herdr_team import paths
 from herdr_team import store
 from herdr_team.errors import HerdrTeamError
 from herdr_team.identity import Author
 
-from support import TempState, whiteboard_on
+from support import assert_mode, TempState, whiteboard_on
 
 
 def operator() -> Author:
@@ -47,7 +48,7 @@ class LayerSwitchTests(unittest.TestCase):
         self.assertEqual(doc["whiteboard"]["by"], "human")
         self.assertEqual(doc["whiteboard"]["via"], "console")
         self.assertTrue(doc["whiteboard"]["at"])
-        self.assertEqual(stat.S_IMODE(os.stat(F.features_path(self.session)).st_mode), 0o600)
+        assert_mode(F.features_path(self.session), 0o600)
         again = F.set_layer(self.session, True, "human", "console")
         self.assertFalse(again["changed"], "a no-op flip writes nothing")
         off = F.set_layer(self.session, False, "human", "cli")
@@ -273,15 +274,19 @@ class McpLaunchTests(unittest.TestCase):
         self.enable()
         spec = F.mcp_spec(self.layout, self.ts.team)
         self.assertEqual(spec["server"], "synapse_canvas")
-        self.assertTrue(spec["command"].endswith("/bin/herdr-synapse"))
+        # the command names the launcher THIS platform can execute: the POSIX
+        # sh script on unix, the ported .cmd on Windows (a POSIX path is a
+        # dead end here, so the spec asks the product for it - 2026-10-21 port
+        # fix, W-22)
+        self.assertTrue(spec["command"].endswith(os.fspath(paths.cli_launcher_path())), spec["command"])
         self.assertTrue(os.path.isabs(spec["command"]))
         self.assertEqual(spec["args"], ["--socket", os.path.abspath(os.fspath(self.layout.socket)), "--team",
                                         os.path.abspath(os.fspath(self.ts.team.root)), "canvas", "mcp"])
         path = F.mcp_config_path(self.ts.team)
         self.assertEqual(spec["config_file"], os.path.abspath(os.fspath(path)))
         self.assertEqual(store.read_json(path), {"mcpServers": {"synapse_canvas": {"type": "stdio", "command": spec["command"], "args": spec["args"]}}})
-        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(path.parent).st_mode), 0o700)
+        assert_mode(path, 0o600)
+        assert_mode(path.parent, 0o700)
         self.assertEqual(F.mcp_spec(self.layout, self.ts.team), spec, "every launch path gets the same spec")
 
     def test_write_false_leaves_the_file_alone(self):

@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Tuple
 from herdr_team import charter, cli, roster, store, workdir
 from herdr_team import cmd_knowledge as CK
 from herdr_team import document_sync as DS
-from support import TempState
+from support import symlink_or_skip, TempState
 from test_cmd_board import pane_api
 from test_inheritance_fixes import Rig, human
 
@@ -116,7 +116,7 @@ class AnImportFromThisTeamsFolderHoweverSpelled(unittest.TestCase):
     def test_a_from_path_through_a_symlink(self):
         link = Path(tempfile.mkdtemp(prefix="ht-link-")) / "team"
         self.addCleanup(lambda: shutil.rmtree(link.parent, ignore_errors=True))
-        os.symlink(os.fspath(self.rig.files["root"]), os.fspath(link))
+        symlink_or_skip(os.fspath(self.rig.files["root"]), os.fspath(link))
         self.assert_resolved(self.import_and_render(os.fspath(link)))
 
     def test_this_teams_own_documents_are_not_offered_as_another_teams(self):

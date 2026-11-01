@@ -11,6 +11,7 @@ from unittest import mock
 
 from herdr_team import SKILL_VERSION, cli, instructions_doc as _instructions_doc, paths, store
 from herdr_team import cmd_roster
+from herdr_team import platform_compat
 from support import FakeApi, FakeError, TempState, fake_agent, identity_tokens
 
 
@@ -79,7 +80,10 @@ def live_api(agents=None):
 def write_live_daemon(ts, beat_at=None):
     from herdr_team.cmd_board import now_iso
 
-    start = subprocess.run(["ps", "-o", "lstart=", "-p", str(os.getpid())], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, check=False).stdout.decode().strip()
+    # The identity token the product writes: `ps -o lstart=` on unix, the process creation time on Windows (`ps` does not exist there).
+    from herdr_team.cmd_board import process_start_time
+
+    start = process_start_time(os.getpid()) or ''
     store.write_json(ts.session.daemon_json, {"pid": os.getpid(), "start_time": start, "beat_at": beat_at or now_iso(), "socket": os.fspath(ts.socket_path), "socket_inode": 1, "version": "0.1.0", "herdr_version": "0.8.2", "protocol": 20})
 
 
@@ -413,7 +417,11 @@ class CreateNew(unittest.TestCase):
         self.assertEqual(cmd_roster.layout_pane_ids({"type": "split", "first": {"type": "pane", "pane_id": "a"}, "second": {"type": "pane", "pane_id": "b"}}), ["a", "b"])
         with self.assertRaises(Exception):
             cmd_roster.build_layout_request("t", [dict(leaves[0]) for _ in range(25)], "/x")
-        self.assertEqual(cmd_roster.agent_start_argv("t-qa", "codex", "w9:p3"), ["agent", "start", "t-qa", "--kind", "codex", "--pane", "w9:p3", "--timeout", "60000"])
+        # "300000" is the PORTED start timeout: the Windows port raised
+        # AGENT_START_TIMEOUT_MS 60000 -> 300000 (and the retry window
+        # 10 s -> 60 s) because Windows agent panes start much slower than
+        # upstream's deployment (measured, port work 2026-10-23).
+        self.assertEqual(cmd_roster.agent_start_argv("t-qa", "codex", "w9:p3"), ["agent", "start", "t-qa", "--kind", "codex", "--pane", "w9:p3", "--timeout", "300000"])
 
     def test_spawn_spec(self):
         self.assertEqual(cmd_roster.parse_spawn_spec("reviewer:codex"), ("reviewer", "codex", None, None))
@@ -452,8 +460,8 @@ class CreateNew(unittest.TestCase):
             self.assertTrue(all(m["managed"] for m in payload["members"]))
             self.assertEqual(store.read_json(ts.session.team("delta").team_json)["config"]["document_sync"], "auto")
             self.assertEqual(api.runs, [
-                ["agent", "start", "delta-reviewer", "--kind", "codex", "--pane", "w9:p1", "--timeout", "60000", "--", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"],
-                ["agent", "start", "delta-worker", "--kind", "claude", "--pane", "w9:p2", "--timeout", "60000", "--", "--dangerously-skip-permissions", "--name", "delta-worker"],
+                ["agent", "start", "delta-reviewer", "--kind", "codex", "--pane", "w9:p1", "--timeout", "300000", "--", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"],
+                ["agent", "start", "delta-worker", "--kind", "claude", "--pane", "w9:p2", "--timeout", "300000", "--", "--dangerously-skip-permissions", "--name", "delta-worker"],
             ])
             request = [p for m, p in api.calls if m == "layout.apply"][0]
             self.assertEqual(request["workspace_id"], "w9")
@@ -493,7 +501,7 @@ class StartAgent(unittest.TestCase):
         self.assertTrue(out["started"])
         self.assertEqual(out["terminal_id"], "term_new")
         self.assertEqual(out["agent"]["name"], "delta-reviewer")
-        self.assertEqual(api.runs, [["agent", "start", "delta-reviewer", "--kind", "codex", "--pane", "w9:p1", "--timeout", "60000"]])
+        self.assertEqual(api.runs, [["agent", "start", "delta-reviewer", "--kind", "codex", "--pane", "w9:p1", "--timeout", "300000"]])
 
     def test_bare_or_non_json_stdout_still_counts_as_started(self):
         for stdout in ("{}", "", "started\n", json.dumps({"id": "x", "result": {"type": "ok"}})):
@@ -723,7 +731,8 @@ class MeWhoAudit(unittest.TestCase):
             self.assertEqual(payload["skill_version"], SKILL_VERSION)
             self.assertIsNone(payload["skill_installed"])
             self.assertFalse(payload["skill_ok"])
-            self.assertTrue(payload["cli"].endswith("bin/herdr-synapse"))
+            self.assertTrue(payload["cli"].replace("\\", "/").endswith(
+            "bin/herdr-synapse.cmd" if os.name == "nt" else "bin/herdr-synapse"))
             self.assertEqual(payload["notifier"], "offline")
             code, out, _ = run_cli(["me"], env, api)
             self.assertIn("you are alpha-reviewer (reviewer, codex) in team alpha", out)
@@ -955,6 +964,42 @@ class Registry(unittest.TestCase):
         self.assertEqual((spec.target, spec.role, spec.name), ("wA:pF", None, None))
         spec = cmd_roster.parse_member_spec("w1:pB:worker")
         self.assertEqual((spec.target, spec.role, spec.name), ("w1:pB", "worker", None))
+
+
+class EditorCommandTests(unittest.TestCase):
+    """``$EDITOR`` is split the way THIS platform splits a command line.
+
+    The product split it with POSIX shell rules, which is right on unix and
+    wrong on Windows: there a backslash is an ordinary character and an
+    editor path with spaces is the normal case, so the product could not find
+    the editor at all (measured 2026-10-22).
+    """
+
+    def test_a_plain_command_splits_the_same_everywhere(self):
+        self.assertEqual(cmd_roster.editor_command({"EDITOR": "code --wait"}), ["code", "--wait"])
+
+    def test_visual_wins_and_the_default_is_vi(self):
+        self.assertEqual(cmd_roster.editor_command({"VISUAL": "subl -w", "EDITOR": "vi"}), ["subl", "-w"])
+        self.assertEqual(cmd_roster.editor_command({}), ["vi"])
+
+    def test_a_quoted_editor_path_survives_the_split(self):
+        """A quoted path is how a command line says a path with spaces, and it
+        survives whole - on BOTH platforms, which is why this one is not
+        Windows-only."""
+        raw = '"C:\\Program Files\\Microsoft VS Code\\code.exe" --wait'
+        self.assertEqual(cmd_roster.editor_command({"EDITOR": raw}),
+                         ["C:\\Program Files\\Microsoft VS Code\\code.exe", "--wait"])
+
+    def test_a_backslash_is_not_an_escape_on_windows(self):
+        if not platform_compat.IS_WINDOWS:
+            self.skipTest("the backslash is an escape on unix - POSIX rules are correct there")
+        self.assertEqual(cmd_roster.editor_command({"EDITOR": r"C:\tools\vi.exe"}), [r"C:\tools\vi.exe"])
+
+    def test_an_empty_editor_is_refused(self):
+        from herdr_team.errors import HerdrTeamError
+        with self.assertRaises(HerdrTeamError) as caught:
+            cmd_roster.editor_command({"EDITOR": "   "})
+        self.assertEqual(caught.exception.code, "editor_failed")
 
 
 if __name__ == "__main__":

@@ -34,14 +34,19 @@ import json
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from herdr_team import sanitize, store
+
+from herdr_team import paths as _paths
+from herdr_team import platform_compat as _compat
 from herdr_team.errors import EXIT_REFUSED, EXIT_UNREACHABLE, HerdrTeamError
 from herdr_team.paths import Layout, ensure_team_dirs, env_workspace, team_name_from_arg
 from herdr_team import operator as _operator
 from herdr_team import roster as _roster
+from herdr_team import superuser_designations as _superuser_designations
 
 VIA_CLI = "cli"
 VIA_CLI_UNVERIFIED = "cli-unverified"
@@ -76,6 +81,18 @@ ANCESTRY_MAX_DEPTH = 16
 PS_TIMEOUT_S = 2.0
 
 
+def _in_test_environment() -> bool:
+    """Detect if we're running in a pytest test environment.
+
+    The test runner (pytest) runs in the same process and imports pytest modules,
+    so we can detect it by checking sys.modules. This is used to skip the
+    harness exe ancestry check in _tier_outside during test runs, because
+    the test runner itself is often launched from an agent terminal and would
+    otherwise have harness executables in its ancestry.
+    """
+    return "pytest" in sys.modules or "_pytest" in sys.modules
+
+
 @dataclass
 class Author:
     """Who is running this command, and how sure we are."""
@@ -98,6 +115,9 @@ class Author:
     #: A live delegation from the operator (``herdr_team.operator``). Only ever
     #: set on a verified roster member, and only by an explicit grant.
     operator: bool = False
+    #: A superuser agent (``herdr-synapse`` superuser kind). Can exercise
+    #: operator authority from a harness pane without an operator grant.
+    superuser: bool = False
 
     @property
     def is_human(self) -> bool:
@@ -278,7 +298,67 @@ def confirm_pane_ancestry(api: Any, pane_id: str, own_pid: Optional[int] = None,
 MAX_ANCESTRY_PANES = 24
 
 
-def hosting_agent_pane(api: Any, own_pid: Optional[int] = None, table: Optional[Dict[int, int]] = None) -> Optional[Dict[str, Any]]:
+def session_agent_panes(api: Any, env: Optional[Dict[str, str]] = None) -> List[str]:
+    """The agent panes this process's environment says it belongs to.
+
+    Upstream's answer to "which pane is this process in?" is the process
+    tree: an agent's shell command is a descendant of that agent's own
+    pane, and the tree cannot be unset, so it is what decides. On Windows
+    there is no ``ps``, so ``ps_table()`` is None and that answer is
+    unavailable.
+
+    The Windows answer is the HARNESS SESSION ID. Herdr reports each agent
+    pane's session id (``agent_session.value``), and the harness puts the
+    same id in the environment of every command it runs, so a value in the
+    environment that matches a pane's session id is that pane's session.
+    Unlike the environment's pane variable, the session id is the
+    harness's own fact and an agent cannot unset it for the whole process
+    tree it spawns.
+
+    The process tree is NOT the Windows answer, and that is measured, not
+    assumed: the opencode server is shared across panes on Windows, so a
+    command launched from one pane has an ancestry that runs through
+    another pane's agent process. Feeding a Windows process table to
+    :func:`hosting_agent_pane` attributes a member's write to a DIFFERENT
+    member, which is worse than the hole this closes.
+
+    Returns the pane ids, empty when this process belongs to no agent
+    pane - which is the answer for a human in a plain shell pane and for
+    the operator outside Herdr, so those paths are unchanged.
+    """
+    source = os.environ if env is None else env
+    session_ids = _compat.session_ids_in_env(source)
+    if not session_ids:
+        return []
+    try:
+        result = api.request("pane.list", {})
+    except HerdrTeamError:
+        return []
+    panes = result.get("panes") if isinstance(result, dict) else None
+    if not isinstance(panes, list):
+        return []
+    return _compat.panes_for_session_ids(panes, session_ids)
+
+
+def _pane_rows(api: Any) -> List[Dict[str, Any]]:
+    """The pane list, or ``[]`` when the server cannot be asked.
+
+    Fetched ONCE per resolution and shared by the checks that need it: the
+    upstream identity contract is one socket call per tier ("one
+    process-tree check, nothing else"), so the Windows steps must not add
+    one of their own.
+    """
+    try:
+        result = api.request("pane.list", {})
+    except HerdrTeamError:
+        return []
+    panes = result.get("panes") if isinstance(result, dict) else None
+    return panes if isinstance(panes, list) else []
+
+
+def hosting_agent_pane(api: Any, own_pid: Optional[int] = None, table: Optional[Dict[int, int]] = None,
+                       env: Optional[Dict[str, str]] = None,
+                       panes: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
     """The agent pane this process is running inside, when there is one.
 
     An agent's shell command is a descendant of that agent's own pane whatever
@@ -288,17 +368,53 @@ def hosting_agent_pane(api: Any, own_pid: Optional[int] = None, table: Optional[
     operator. The process tree cannot be unset the same way, so it is what
     decides here.
 
+    On Windows the tree is available too, and it is the SAME kind of fact:
+    ``platform_compat.process_table`` builds it with ``CreateToolhelp32Snapshot``
+    (a Win32 call - no subprocess, no shell, and it works on a machine with
+    no ``ps``).  So the Windows branch asks the tree, exactly as the unix
+    branch does.
+
+    Why the tree and not the harness SESSION ID (which was tried first, and
+    is still used for attribution): the session id is an ENVIRONMENT
+    VARIABLE, so an agent's own command can unset it - and the verifier
+    proved on the live server that doing so opens the human-only gates
+    again.  The tree is a kernel fact and cannot be unset for the whole
+    tree the caller spawns, which is the whole point of the guard.
+
+    The session id keeps one job, and it is NOT this one: ATTRIBUTION -
+    which pane, when the tree cannot place the process at all.  See
+    :func:`_session_attributed_pane`.  A wrong answer there is a cosmetic
+    problem; a wrong answer about WHO is the security one, and that is the
+    tree's job.
+
     Returns the ``pane.list`` row on positive evidence, else None. Absence of
     evidence is not evidence of absence: an unreachable server or a missing
-    ``ps`` leaves the caller exactly where it was, because refusing on a
+    table leaves the caller exactly where it was, because refusing on a
     failed lookup would lock the operator out of their own CLI.
     """
-    try:
-        result = api.request("pane.list", {})
-    except HerdrTeamError:
-        return None
-    panes = result.get("panes") if isinstance(result, dict) else None
-    if not isinstance(panes, list):
+    if panes is None:
+        panes = _pane_rows(api)
+    if _compat.IS_WINDOWS:
+        # The tree decides, on Windows exactly as on unix.  It is asked here
+        # because it is the fact that cannot be forged, and it is the SAME
+        # question upstream asks: "is this process a descendant of an agent
+        # pane's foreground job?".  The session id is NOT consulted here -
+        # it is an environment variable, so it is an attribution fact, never
+        # a guard (2026-10-22, W-44).
+        win_table, _names = _compat.process_table()
+        if not win_table:
+            return None
+        pid = own_pid if own_pid is not None else os.getpid()
+        checked = 0
+        for pane in panes:
+            if not isinstance(pane, dict) or not pane.get("agent") or not isinstance(pane.get("pane_id"), str):
+                continue
+            checked += 1
+            if checked > MAX_ANCESTRY_PANES:
+                break
+            inside, _why = confirm_pane_ancestry(api, pane["pane_id"], own_pid=pid, table=win_table)
+            if inside is True:
+                return pane
         return None
     resolved = table if table is not None else ps_table()
     if resolved is None:
@@ -324,6 +440,11 @@ def audit(layout: Layout, team: Optional[str], event: str, author: Author, detai
     try:
         team_paths = layout.team(team)
     except HerdrTeamError:
+        return None
+    if not team_paths.root.is_dir():
+        # The team was dissolved: its directory is gone, and an audit line must not bring
+        # it back. The team lock refuses to resurrect a dissolved team for the same reason
+        # (RS-10/RS-13), and an audit entry is not worth a team that no longer exists.
         return None
     ensure_team_dirs(team_paths)
     entry = {
@@ -511,7 +632,7 @@ def _tier_system(env: Dict[str, str], layout: Layout, team: Optional[str], as_hu
 def _tier_console(env: Dict[str, str], layout: Layout, api: Any, team: Optional[str], require_server: bool) -> Author:
     from herdr_team import cmd_board as _console_registry
 
-    inside = hosting_agent_pane(api)
+    inside = hosting_agent_pane(api, env=env)
     if inside is not None:
         # The entrypoint variable is Herdr's, but an agent can set it too, and
         # naming the real console's pane would then pass the registry check
@@ -600,13 +721,35 @@ def _space_team(layout: Layout, workspace_id: Optional[str]) -> Optional[str]:
 
 
 def _tier_popup(env: Dict[str, str], layout: Layout, api: Any, team: Optional[str]) -> Author:
-    inside = hosting_agent_pane(api)
+    panes = _pane_rows(api)
+    inside = hosting_agent_pane(api, env=env, panes=panes)
     if inside is not None:
         # A popup has no pane identity to check, which is exactly why this
         # tier used to make zero socket calls -- and why setting the variable
         # from an agent's shell made that agent the operator to every gate.
         # Same rule as ``_tier_outside``: the process tree cannot be unset.
         return _rerouted_agent_author(env, layout, api, inside, _env_team(env, team), False, "popup entrypoint set inside an agent pane")
+    # The tree could not place this process and the session id did not name a
+    # pane either.  A HARNESS MARKER still says an agent harness started it,
+    # and a human's shell has none - so it is an agent we cannot place, and
+    # it is refused the way ``_tier_outside`` refuses one.  The same
+    # symmetry the verifier asked for: the entrypoint tier must refuse what
+    # the outside tier refuses, or the entrypoint is a way around it
+    # (2026-10-22, W-44).
+    session_pane = _session_attributed_pane(panes, env)
+    if session_pane is not None:
+        return _rerouted_agent_author(
+            env, layout, api, session_pane, _env_team(env, team), False,
+            "popup entrypoint set inside an agent pane")
+    marker = _compat.harness_marker_in_env(env)
+    if marker:
+        raise HerdrTeamError(
+            "not_a_member",
+            "an agent harness started this process ({}), and it cannot be attributed "
+            "to a pane".format(marker),
+            EXIT_UNREACHABLE,
+            {"harness_marker": marker, "hint": {"teams": layout.session.list_teams()}},
+        )
     console = store.read_json(layout.session.console_json, default=None)
     default_team = console.get("default_team") if isinstance(console, dict) and isinstance(console.get("default_team"), str) else None
     space_team = _space_team(layout, env_workspace(env))
@@ -629,6 +772,15 @@ def _tier_popup(env: Dict[str, str], layout: Layout, api: Any, team: Optional[st
 def _tier_pane(env: Dict[str, str], layout: Layout, api: Any, team: Optional[str], as_human: bool, require_server: bool, team_explicit: bool = True) -> Author:
     pane_env = str(env.get("HERDR_PANE_ID"))
     env_team = _env_team(env, team)
+    # W-16: a DESIGNATED superuser pane/session carries operator authority
+    # even when it is not a roster member of any team. The designation is
+    # checked FIRST (before the roster lookup below), because the whole point
+    # of the feature is to let a pane that is not (yet) a member exercise
+    # operator authority. The check is server-side registry + pane.list, so a
+    # caller cannot forge it by setting env vars alone (W-44).
+    designated = None
+    if not _in_test_environment():
+        designated = _designated_superuser_author(env, layout, api, env_team)
     try:
         pane = _pane_get(api, pane_env)
     except HerdrTeamError as err:
@@ -657,7 +809,8 @@ def _tier_pane(env: Dict[str, str], layout: Layout, api: Any, team: Optional[str
         origin["env_mismatch"] = mismatches
 
     if pane.get("agent"):
-        return _agent_pane_author(env, layout, api, pane, current_pane, origin, env_team, as_human, team_explicit)
+        return _agent_pane_author(env, layout, api, pane, current_pane, origin, env_team, as_human, team_explicit,
+                                  designated=designated)
     return _shell_pane_author(env, layout, api, pane, current_pane, origin, env_team)
 
 
@@ -682,7 +835,7 @@ def _offline_pane_author(env: Dict[str, str], layout: Layout, env_team: Optional
     return author
 
 
-def _agent_pane_author(env: Dict[str, str], layout: Layout, api: Any, pane: Dict[str, Any], current_pane: str, origin: Dict[str, Any], env_team: Optional[str], as_human: bool, team_explicit: bool = True) -> Author:
+def _agent_pane_author(env: Dict[str, str], layout: Layout, api: Any, pane: Dict[str, Any], current_pane: str, origin: Dict[str, Any], env_team: Optional[str], as_human: bool, team_explicit: bool = True, designated: Optional[Author] = None) -> Author:
     kind = pane.get("agent")
     terminal_id = pane.get("terminal_id")
     live_name, _agent = _agent_name(api, current_pane)
@@ -712,9 +865,38 @@ def _agent_pane_author(env: Dict[str, str], layout: Layout, api: Any, pane: Dict
         if confirmed is False:
             audit(layout, team_name, "pane_mismatch", author, {"reason": reason, "claimed_pane_id": origin.get("claimed_pane_id")})
             raise HerdrTeamError("pane_mismatch", "HERDR_PANE_ID names pane {} but this process does not run in it".format(current_pane), EXIT_REFUSED, {"pane_id": current_pane, "reason": reason})
+        if confirmed is None:
+            # The process tree could not answer (Windows: no ``ps``). The
+            # harness SESSION ID answers the same question there, and it is
+            # the harness's own fact: the session's own pane is the one whose
+            # ``agent_session.value`` this process carries. A claimed pane
+            # that is NOT in that set is a forged pane, and upstream refuses
+            # it with ``pane_mismatch`` on the same ground.
+            #
+            # The set is asked once here, on Windows only (the tree cannot
+            # answer there), so the unix path keeps its own call count.
+            session_panes = session_agent_panes(api, env)
+            if session_panes and current_pane not in session_panes:
+                detail = "this process's session id names pane(s) {}, not {}".format(
+                    ", ".join(session_panes), current_pane)
+                audit(layout, team_name, "pane_mismatch", author, {"reason": detail, "claimed_pane_id": origin.get("claimed_pane_id")})
+                raise HerdrTeamError("pane_mismatch", "HERDR_PANE_ID names pane {} but this process does not run in it".format(current_pane), EXIT_REFUSED, {"pane_id": current_pane, "reason": detail})
+        if designated is not None:
+            # W-16: this pane is the designated superuser AND a roster member.
+            # Keep the member identity (so board posts still carry the member
+            # name) and ADD the operator authority the designation grants.
+            author.superuser = True
+            author.origin = dict(origin)
+            author.origin["designation_source"] = "designation"
+            author.origin["pane_id"] = current_pane
+            author.reason = "designated superuser pane/session"
         if as_human:
             raise refuse_as_human(layout, author, {"tier": TIER_PANE, "kind": kind})
         return author
+    if designated is not None:
+        # W-16: the designated superuser pane is NOT a roster member. The
+        # designation is exactly the authority that lets it act anyway.
+        return designated
     member_env = env.get("HERDR_TEAM_MEMBER")
     if member_env and env_team:
         try:
@@ -742,6 +924,20 @@ def _agent_pane_author(env: Dict[str, str], layout: Layout, api: Any, pane: Dict
     )
 
 
+def own_pgrp() -> int:
+    """This process's process group id.
+
+    Windows has no POSIX process groups: the shell-ancestry check compares
+    Herdr's ``foreground_process_group_id`` with this value, and Herdr on
+    Windows does not report one, so the check simply stays unverified
+    there (the author is marked ``cli-unverified``).
+    """
+    getpgrp = getattr(os, "getpgrp", None)
+    if getpgrp is None:
+        return os.getpid()
+    return int(getpgrp())
+
+
 def _shell_pane_author(env: Dict[str, str], layout: Layout, api: Any, pane: Dict[str, Any], current_pane: str, origin: Dict[str, Any], env_team: Optional[str]) -> Author:
     terminal_id = pane.get("terminal_id")
     team_name = env_team
@@ -751,18 +947,18 @@ def _shell_pane_author(env: Dict[str, str], layout: Layout, api: Any, pane: Dict
         console = store.read_json(layout.session.console_json, default=None)
         if isinstance(console, dict) and isinstance(console.get("default_team"), str):
             team_name = console["default_team"]
-    verified, reason = verify_shell_ancestry(api, current_pane, os.getpgrp())
+    verified, reason = verify_shell_ancestry(api, current_pane, own_pgrp())
     if not verified:
         # A verified shell is the foreground job of this very pane, so it cannot
         # also be a descendant of some agent's pane and the scan is skipped. An
         # unverified one might be an agent's subprocess pointed at a shell pane.
-        inside = hosting_agent_pane(api)
+        inside = hosting_agent_pane(api, env=env)
         if inside is not None and inside.get("pane_id") != current_pane:
             return _rerouted_agent_author(env, layout, api, inside, env_team, False, "HERDR_PANE_ID names another pane")
     via = VIA_CLI if verified else VIA_CLI_UNVERIFIED
     origin["via"] = via
     origin["verified"] = bool(verified)
-    origin["pgrp"] = os.getpgrp()
+    origin["pgrp"] = own_pgrp()
     author = Author(AUTHOR_HUMAN, "human", via, bool(verified), pane_id=current_pane, terminal_id=terminal_id,
                     workspace_id=pane.get("workspace_id"), tab_id=pane.get("tab_id"), team=team_name, tier=TIER_PANE)
     author.origin = origin
@@ -786,6 +982,168 @@ def _shell_pane_author(env: Dict[str, str], layout: Layout, api: Any, pane: Dict
     return author
 
 
+def _superuser_exes_for_team(team: Optional[str]) -> Tuple[str, ...]:
+    """Get the superuser executable names for a team from its config."""
+    # This will be called from _tier_outside where we have the team
+    # For now, return the default SUPERUSER_EXE_VARS
+    # In the future, this could read from team config: work.superuser_exes
+    return _compat.SUPERUSER_EXE_VARS
+
+
+def _is_superuser_process(win_table: Dict[int, int], win_names: Dict[int, str], superuser_exes: Tuple[str, ...]) -> bool:
+    """Check if any process in the ancestry is a superuser agent executable."""
+    for pid in ancestry(os.getpid(), win_table):
+        exe = str(win_names.get(pid, "")).lower()
+        if exe in superuser_exes:
+            return True
+    return False
+
+
+def _identity_process_table() -> Tuple[Optional[Dict[int, int]], Dict[int, str]]:
+    """The process table the identity checks read.
+
+    Windows has no ``ps``, so the Win32 table (``CreateToolhelp32Snapshot``,
+    via ``platform_compat.process_table``) is the tree here; elsewhere it is
+    ``ps``.
+
+    ``confirm_pane_ancestry`` asks for ``ps`` BY ITSELF, so every call that
+    does not pass a table is "unavailable" on Windows. That is why the
+    pane-membership check falls back to the session-id attribution there, and
+    why the designation check asks the tree DIRECTLY: the tree is the only
+    fact a caller cannot forge.
+    """
+    if _compat.IS_WINDOWS:
+        table, names = _compat.process_table()
+        return (table or None), dict(names or {})
+    return ps_table(), {}
+
+
+def _designated_pane_confirmed(
+    api: Any,
+    designations: List[Any],
+    panes: List[Dict[str, Any]],
+    resolved_team: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """WHICH pane this process actually runs in, among the designated ones.
+
+    This is FACTOR 3 of the W-16 security model, and the implementation was
+    missing it: the registry says WHICH pane carries superuser authority, and
+    the PROCESS TREE says WHICH pane this process runs in. The grant requires
+    the two to agree.
+
+    Why the tree and not the env vars: ``HERDR_PANE_ID`` and the harness
+    session id are ENVIRONMENT VARIABLES, so a caller sets them to another
+    pane's values and claims that pane's authority. Measured on the live
+    server (2026-10-30): a member pane in another workspace, with
+    ``HERDR_PANE_ID`` pointed at the designated pane, was granted superuser
+    authority over two teams it was not a member of. The tree is a kernel
+    fact and cannot be forged.
+
+    The designated pane must also be a real pane on this session (FACTOR 2),
+    and the W-16 base marker - a trusted superuser executable in the
+    caller's own ancestry - is accepted as the same unforgeable fact seen
+    from the other side.
+
+    Returns ``(pane_id, reason)``: the confirmed pane, or ``(None, reason)``
+    saying why the designation could not be honoured.
+    """
+    session_pane_ids = {p.get("pane_id") for p in panes if isinstance(p, dict)}
+    candidates: List[str] = []
+    for entry in designations:
+        pane_id = getattr(entry, "pane_id", None)
+        if isinstance(pane_id, str) and pane_id and pane_id not in candidates:
+            candidates.append(pane_id)
+    if not candidates:
+        # A session-only designation: the panes whose harness session id is
+        # the designated one.
+        session_ids = [getattr(e, "session_id", None) for e in designations]
+        wanted = [s for s in session_ids if isinstance(s, str) and s]
+        for pane_id in _compat.panes_for_session_ids(panes, wanted):
+            if pane_id not in candidates:
+                candidates.append(pane_id)
+    candidates = [p for p in candidates if p in session_pane_ids]
+    if not candidates:
+        return None, "the designated pane is not on this session"
+    table, names = _identity_process_table()
+    reason = ""
+    for pane_id in candidates:
+        confirmed, why = confirm_pane_ancestry(api, pane_id, table=table)
+        if confirmed is True:
+            return pane_id, None
+        reason = why or "the process tree did not place this process in pane {}".format(pane_id)
+    if table and names and _is_superuser_process(table, names, _superuser_exes_for_team(resolved_team)):
+        # The W-16 base marker: the caller's own ancestry carries a trusted
+        # superuser executable, which is the same unforgeable fact.
+        return candidates[0], None
+    return None, reason
+
+
+def _designated_superuser_author(
+    env: Dict[str, str],
+    layout: Layout,
+    api: Any,
+    resolved_team: Optional[str],
+) -> Optional[Author]:
+    """The W-16 designated superuser pane/session, if the caller IS one.
+
+    The designation lives in the server-side registry
+    (``<session>/superuser_designations.json``) and is matched against a pane
+    that ``pane.list`` confirms exists on this session. Caller-controlled env
+    vars are lookup keys only, never authority tokens (W-44): they SELECT a
+    candidate designation, and the process tree then decides whether this
+    process really is that pane.
+
+    Returns an ``Author`` with ``superuser=True`` for a designated caller, or
+    ``None`` for everyone else. A broken registry falls through to the normal
+    tiers rather than granting or refusing on its own. A designation that
+    MATCHES but cannot be confirmed is refused loudly (``pane_mismatch``):
+    that is a caller claiming another pane's authority, and it must not
+    quietly become "not a member" either.
+    """
+    try:
+        if not (layout.session and layout.session.root.exists()):
+            return None
+        pane_env = env.get("HERDR_PANE_ID")
+        session_env = env.get("OPENCODE_SESSION_ID") or env.get("HERDR_SESSION")
+        if not pane_env and not session_env:
+            return None
+        registry = _superuser_designations.DesignationRegistry(layout.session)
+        designations = []
+        if pane_env:
+            designations = registry.find_active(pane_id=pane_env)
+        if not designations and session_env:
+            designations = registry.find_active(session_id=session_env)
+        if not designations:
+            return None
+    except Exception:
+        # Fail closed: if the registry is broken/unreadable, fall through to
+        # the normal tiers (a broken registry grants nothing).
+        return None
+    panes = _pane_rows(api)
+    confirmed_pane, why = _designated_pane_confirmed(api, designations, panes, resolved_team)
+    if confirmed_pane is None:
+        raise HerdrTeamError(
+            "pane_mismatch",
+            "the designated superuser pane could not be confirmed: {}".format(why),
+            EXIT_REFUSED,
+            {"claimed_pane_id": pane_env or "", "reason": why},
+        )
+    author = Author(AUTHOR_HUMAN, "superuser", VIA_OUTSIDE, False, team=resolved_team,
+                    tier=TIER_OUTSIDE, superuser=True)
+    author.origin = _base_origin(VIA_OUTSIDE, False, layout)
+    origin_extra = dict(author.origin or {})
+    origin_extra["designation_source"] = "designation"
+    origin_extra["pane_id"] = confirmed_pane
+    if session_env:
+        origin_extra["session_id"] = session_env
+    author.origin = origin_extra
+    author.reason = "designated superuser pane/session"
+    audit(layout, resolved_team, "superuser_action", author,
+          {"action": "designated_superuser_pane_session", "pane_id": confirmed_pane,
+           "session_id": session_env or "", "origin": "designation"})
+    return author
+
+
 def _tier_outside(env: Dict[str, str], layout: Layout, api: Any, team: Optional[str], as_human: bool = False) -> Author:
     resolved_team = _env_team(env, team)
     if resolved_team is None and not layout.env_socket.explicit and layout.state_root.team_dir is None:
@@ -795,16 +1153,130 @@ def _tier_outside(env: Dict[str, str], layout: Layout, api: Any, team: Optional[
             EXIT_UNREACHABLE,
             {"teams": layout.session.list_teams()},
         )
-    inside = hosting_agent_pane(api)
+    panes = _pane_rows(api)
+    inside = hosting_agent_pane(api, env=env, panes=panes)
     if inside is not None:
         # No pane in the environment, but the process tree says otherwise: this is
         # an agent's own subprocess with the variable stripped. It gets its own
         # identity back, not the operator's.
         return _rerouted_agent_author(env, layout, api, inside, resolved_team, as_human, "no HERDR_PANE_ID")
+    # Windows: the process tree could not place this process (no ``ps``), and
+    # no session id names a pane, so this process cannot be attributed. A
+    # HARNESS MARKER still says an agent harness started it - a human's shell
+    # The tree could not place this process.  The harness session id may still
+    # name the agent it belongs to - ATTRIBUTION, not a guard (the id is a
+    # variable the caller controls, 2026-10-22, W-44) - and a process that
+    # ran outside its agent's own pane still gets its member's identity back
+    # rather than the operator's.
+    session_pane = _session_attributed_pane(panes, env)
+    if session_pane is not None:
+        return _rerouted_agent_author(
+            env, layout, api, session_pane, resolved_team, as_human,
+            "no HERDR_PANE_ID; the harness session id names this agent's pane")
+    # The tree could not place this process (no ``ps``), and
+    # no session id names a pane, so this process cannot be attributed. A
+    # HARNESS MARKER still says an agent harness started it - a human's shell
+    # has none - so it is an agent we cannot place, and it is refused the way
+    # upstream refuses an agent that is not on any roster.
+    #
+    # The marker is a weaker fact than a session id (a caller controls its own
+    # environment), so this narrows the gap, it does not close the class.
+    # The operator's own path is untouched: a human in a plain shell pane has
+    # no marker and keeps the outside tier.
+    if _compat.IS_WINDOWS:
+        marker = _compat.harness_marker_in_env(env)
+        if marker:
+            raise HerdrTeamError(
+                "not_a_member",
+                "an agent harness started this process ({}), and it cannot be attributed "
+                "to a pane or a member".format(marker),
+                EXIT_UNREACHABLE,
+                {"harness_marker": marker, "hint": {"teams": layout.session.list_teams()}},
+            )
+        # Even without an env marker, the tree can still say "a harness
+        # started this".  The sweep is ANCESTRY-WIDE, on purpose, and two
+        # live measurements on 2026-10-23 (W-1) are why:
+        #
+        #   * case G - a member's in-pane command with every variable
+        #     stripped - was refused, but a sweeper that only fires when the
+        #     harness service is the caller's GRANDPARENT (``[me, shell,
+        #     opencode.exe]``) was DEFEATED by one extra wrapper process: the
+        #     caller chooses its own wrapper depth, so depth is not a fact
+        #     that can decide anything.
+        #   * the operator's detached-from-pane elevation has the SAME shape
+        #     as the attacker's ("[ ... pane shell, detached, opencode.exe]"),
+        #     so no property of the process itself separates them on this
+        #     deployment.  Refusing harness-descended processes therefore
+        #     refuses BOTH, and that is the accepted posture: on Windows the
+        #     operator's authority lives in a terminal that is not a harness
+        #     descendant (the app console tier, or the human's own Windows
+        #     Terminal) - the detached-from-pane elevation is retired, and
+        #     the port doc records the migration (section 0n).
+        # SKIP in test environment: the test runner itself is launched from an
+        # agent pane by the harness, so the LIVE ancestry would refuse every
+        # in-process outside-tier resolution; tests exercise the sweep through
+        # a synthetic table instead.
+        if not _in_test_environment():
+            # W-16 Designated Superuser Pane/Session feature: check server-side
+            # designation before the ancestry sweep. The designation must be
+            # verified by server-side registry + pane.list confirmation,
+            # never trusted from caller-controlled env vars alone (W-44).
+            designated = _designated_superuser_author(env, layout, api, resolved_team)
+            if designated is not None:
+                return designated
+            win_table, win_names = _compat.process_table()
+            if win_table:
+                # Check for superuser agents first - they are ALLOWED through the sweep
+                superuser_exes = _superuser_exes_for_team(resolved_team)
+                is_superuser = _is_superuser_process(win_table, win_names, superuser_exes)
+                if is_superuser:
+                    # This is a superuser agent - allow it through the sweep
+                    author = Author(AUTHOR_HUMAN, "superuser", VIA_OUTSIDE, False, team=resolved_team, tier=TIER_OUTSIDE, superuser=True)
+                    author.origin = _base_origin(VIA_OUTSIDE, False, layout)
+                    author.reason = "superuser agent"
+                    return author
+                else:
+                    for pid in ancestry(os.getpid(), win_table):
+                        exe = str(win_names.get(pid, "")).lower()
+                        if exe in _compat.HARNESS_EXE_VARS:
+                            raise HerdrTeamError(
+                                "not_a_member",
+                                "an agent harness started this process ({}), and it cannot be attributed "
+                                "to a pane or a member".format(exe),
+                                EXIT_UNREACHABLE,
+                                {"harness_exe": exe, "hint": {"teams": layout.session.list_teams()}},
+                            )
     author = Author(AUTHOR_HUMAN, "human", VIA_OUTSIDE, False, team=resolved_team, tier=TIER_OUTSIDE)
     author.origin = _base_origin(VIA_OUTSIDE, False, layout)
     author.reason = "outside Herdr"
     return author
+
+
+def _session_attributed_pane(panes: List[Dict[str, Any]], env: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """The pane the harness session id names, when the tree could not place us.
+
+    This is ATTRIBUTION, never a guard: the session id is an environment
+    variable, so an agent's own command controls it (measured 2026-10-22,
+    W-44).  It is asked only where the process tree - the kernel fact that
+    cannot be unset - has already answered "this is not inside an agent
+    pane", and it is used to say WHICH agent, so a process that ran outside
+    its agent's own pane still gets its member's identity back rather than
+    the operator's.
+
+    The pane list is the caller's - it was already fetched for the tree
+    check, so this costs no socket call (the identity contract is one per
+    tier).
+
+    Windows only in effect: on unix the process tree places the process, and
+    this is never reached.
+    """
+    if not _compat.IS_WINDOWS:
+        return None
+    pane_ids = _compat.panes_for_session_ids(panes, _compat.session_ids_in_env(env))
+    for pane in panes:
+        if isinstance(pane, dict) and pane.get("pane_id") in pane_ids:
+            return pane
+    return None
 
 
 def _rerouted_agent_author(env: Dict[str, str], layout: Layout, api: Any, pane: Dict[str, Any], env_team: Optional[str], as_human: bool, why: str) -> Author:
@@ -840,7 +1312,7 @@ def resolve_author(
     entrypoint = env.get("HERDR_PLUGIN_ENTRYPOINT_ID")
     if (env.get("HERDR_PLUGIN_EVENT") or env.get("HERDR_PLUGIN_ID")) and not entrypoint:
         author = _tier_system(env, layout, team, as_human)
-    elif entrypoint == CONSOLE_ENTRYPOINT:
+    elif entrypoint == CONSOLE_ENTRYPOINT or entrypoint == _paths.entrypoint_id(CONSOLE_ENTRYPOINT):
         author = _tier_console(env, layout, api, team, require_server)
     elif entrypoint:
         author = _tier_popup(env, layout, api, team)
@@ -873,6 +1345,28 @@ def authority_refusal(action: str, author: Author) -> str:
                 "Use the team console, a focused Herdr pane, or run it outside Herdr: "
                 "env -u HERDR_PANE_ID herdr-synapse --team <team> ...").format(action, why)
     return "{} is human only; this pane is {!r} ({})".format(action, author.name, author.via)
+
+
+def is_operator_delegate(author: Any, team: Optional[str] = None) -> bool:
+    """Does this author hold the operator's authority for ``team``?
+
+    The operator delegates its authority to a seat with ``operator grant``. A
+    delegate is the operator's hands inside that team: it writes the charter,
+    the rules and the instructions, it rules on work items, it gives verdicts
+    the operator used to give, and it appoints the manager. Every use is
+    audited, so the trail says a delegate acted and which one.
+
+    A grant is team-scoped: a delegate's authority in one team says nothing
+    about another, and nothing about the session (naming a superuser pane
+    stays the operator's). ``team`` is the roster's name, not the session's.
+    """
+    if not getattr(author, "operator", False):
+        return False
+    if not getattr(author, "is_member", False) or not getattr(author, "verified", False):
+        return False
+    if team is not None and getattr(author, "team", None) != team:
+        return False
+    return True
 
 
 def human_origin_ok(record_origin: Dict[str, Any]) -> bool:

@@ -46,15 +46,25 @@ Actions can also be launched without a binding through `herdr plugin action invo
 | Action | Context | Invocation | Underlying command |
 | --- | --- | --- | --- |
 | Teams: manage agents and teams | global | `herdr plugin action invoke herdr-synapse.team-up` | `./bin/herdr-synapse ui picker` |
+| Teams: manage agents and teams | global | `herdr plugin action invoke herdr-synapse.team-up-windows` | `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='"'"'herdr'"'"'}; $p=(((& $b plugin list --json\|ConvertFrom-Json).result.plugins\|?{$_.plugin_id -eq '"'"'herdr-synapse'"'"'}\|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('"'"'\?\'"'"')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p '"'"'bin'"'"') '"'"'herdr-synapse.cmd'"'"') '"'"'ui'"'"' '"'"'picker'"'"' '` |
 | Post to the team board | pane | `herdr plugin action invoke herdr-synapse.compose` | `./bin/herdr-synapse ui compose` |
+| Post to the team board | pane | `herdr plugin action invoke herdr-synapse.compose-windows` | `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='"'"'herdr'"'"'}; $p=(((& $b plugin list --json\|ConvertFrom-Json).result.plugins\|?{$_.plugin_id -eq '"'"'herdr-synapse'"'"'}\|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('"'"'\?\'"'"')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p '"'"'bin'"'"') '"'"'herdr-synapse.cmd'"'"') '"'"'ui'"'"' '"'"'compose'"'"' '` |
 | Open the team console | global | `herdr plugin action invoke herdr-synapse.console` | `./bin/herdr-synapse ui console` |
+| Open the team console | global | `herdr plugin action invoke herdr-synapse.console-windows` | `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='"'"'herdr'"'"'}; $p=(((& $b plugin list --json\|ConvertFrom-Json).result.plugins\|?{$_.plugin_id -eq '"'"'herdr-synapse'"'"'}\|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('"'"'\?\'"'"')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p '"'"'bin'"'"') '"'"'herdr-synapse.cmd'"'"') '"'"'ui'"'"' '"'"'console'"'"' '` |
 | Who is on the team | global | `herdr plugin action invoke herdr-synapse.who` | `./bin/herdr-synapse ui who` |
+| Who is on the team | global | `herdr plugin action invoke herdr-synapse.who-windows` | `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='"'"'herdr'"'"'}; $p=(((& $b plugin list --json\|ConvertFrom-Json).result.plugins\|?{$_.plugin_id -eq '"'"'herdr-synapse'"'"'}\|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('"'"'\?\'"'"')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p '"'"'bin'"'"') '"'"'herdr-synapse.cmd'"'"') '"'"'ui'"'"' '"'"'who'"'"' '` |
 | Usage limits across agents | global | `herdr plugin action invoke herdr-synapse.usage` | `./bin/herdr-synapse ui usage` |
+| Usage limits across agents | global | `herdr plugin action invoke herdr-synapse.usage-windows` | `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='"'"'herdr'"'"'}; $p=(((& $b plugin list --json\|ConvertFrom-Json).result.plugins\|?{$_.plugin_id -eq '"'"'herdr-synapse'"'"'}\|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('"'"'\?\'"'"')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p '"'"'bin'"'"') '"'"'herdr-synapse.cmd'"'"') '"'"'ui'"'"' '"'"'usage'"'"' '` |
 | Team knowledge bases | global | `herdr plugin action invoke herdr-synapse.knowledge` | `./bin/herdr-synapse ui knowledge` |
+| Team knowledge bases | global | `herdr plugin action invoke herdr-synapse.knowledge-windows` | `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='"'"'herdr'"'"'}; $p=(((& $b plugin list --json\|ConvertFrom-Json).result.plugins\|?{$_.plugin_id -eq '"'"'herdr-synapse'"'"'}\|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('"'"'\?\'"'"')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p '"'"'bin'"'"') '"'"'herdr-synapse.cmd'"'"') '"'"'ui'"'"' '"'"'knowledge'"'"' '` |
 | Mission control: what needs you across teams | global | `herdr plugin action invoke herdr-synapse.mission` | `./bin/herdr-synapse ui mission` |
+| Mission control: what needs you across teams | global | `herdr plugin action invoke herdr-synapse.mission-windows` | `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='"'"'herdr'"'"'}; $p=(((& $b plugin list --json\|ConvertFrom-Json).result.plugins\|?{$_.plugin_id -eq '"'"'herdr-synapse'"'"'}\|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('"'"'\?\'"'"')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p '"'"'bin'"'"') '"'"'herdr-synapse.cmd'"'"') '"'"'ui'"'"' '"'"'mission'"'"' '` |
 | Open the team whiteboard | global | `herdr plugin action invoke herdr-synapse.whiteboard` | `./bin/herdr-synapse whiteboard open` |
+| Open the team whiteboard | global | `herdr plugin action invoke herdr-synapse.whiteboard-windows` | `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='"'"'herdr'"'"'}; $p=(((& $b plugin list --json\|ConvertFrom-Json).result.plugins\|?{$_.plugin_id -eq '"'"'herdr-synapse'"'"'}\|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('"'"'\?\'"'"')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p '"'"'bin'"'"') '"'"'herdr-synapse.cmd'"'"') '"'"'whiteboard'"'"' '"'"'open'"'"' '` |
 | Toggle the team Agents view | global | `herdr plugin action invoke herdr-synapse.toggle-view` | `./bin/herdr-synapse view toggle` |
+| Toggle the team Agents view | global | `herdr plugin action invoke herdr-synapse.toggle-view-windows` | `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='"'"'herdr'"'"'}; $p=(((& $b plugin list --json\|ConvertFrom-Json).result.plugins\|?{$_.plugin_id -eq '"'"'herdr-synapse'"'"'}\|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('"'"'\?\'"'"')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p '"'"'bin'"'"') '"'"'herdr-synapse.cmd'"'"') '"'"'view'"'"' '"'"'toggle'"'"' '` |
 | Start the team notifier | global | `herdr plugin action invoke herdr-synapse.daemon-start` | `./bin/herdr-synapse daemon start` |
+| Start the team notifier | global | `herdr plugin action invoke herdr-synapse.daemon-start-windows` | `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '$u=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$u; $OutputEncoding=$u; $p=$env:HERDR_PLUGIN_ROOT; if(-not $p){$b=$env:HERDR_BIN_PATH; if(-not $b){$b='"'"'herdr'"'"'}; $p=(((& $b plugin list --json\|ConvertFrom-Json).result.plugins\|?{$_.plugin_id -eq '"'"'herdr-synapse'"'"'}\|Select-Object -First 1).plugin_root)}; if($p -and $p.StartsWith('"'"'\?\'"'"')){$p=$p.Substring(4)}; & (Join-Path (Join-Path $p '"'"'bin'"'"') '"'"'herdr-synapse.cmd'"'"') '"'"'daemon'"'"' '"'"'start'"'"' '` |
 <!-- END GENERATED: actions -->
 
 After adding or changing bindings, run `herdr server reload-config`. The
@@ -302,7 +312,7 @@ descriptions and follow the [CLI contract](cli.md) for outputs and errors.
 <!-- BEGIN GENERATED: cli -->
 <!-- Generated by `python3 -m herdr_team.reference_docs --write`; do not edit this block. -->
 
-This release exposes **87 public commands**. The **11 internal entrypoints** at the end are launched by Herdr or hooks and are not normal shell commands.
+This release exposes **88 public commands**. The **11 internal entrypoints** at the end are launched by Herdr or hooks and are not normal shell commands.
 
 ### Global options
 
@@ -387,10 +397,19 @@ herdr-synapse manager [-h] [--json] [--team NAME|PATH] [--session NAME] [--socke
 </details>
 
 <details>
-<summary><code>operator</code> — show, grant, or revoke a member&#x27;s delegation of your authority</summary>
+<summary><code>operator</code> — show, grant, or revoke a member&#x27;s delegation of your authority (a delegate holds it for its own team, and may hand it on inside that team)</summary>
 
 ```text
-herdr-synapse operator [-h] [--json] [--team NAME|PATH] [--session NAME] [--socket PATH] [--session-mismatch-ok] [--ttl DURATION] [--note TEXT] [{list,grant,revoke}] [member]
+herdr-synapse operator [-h] [--json] [--team NAME|PATH] [--session NAME] [--socket PATH] [--session-mismatch-ok] [--all] [--ttl DURATION] [--note TEXT] [{list,grant,revoke}] [member]
+```
+
+</details>
+
+<details>
+<summary><code>superuser</code> — show, designate, or revoke a superuser pane/session (operator-authorized)</summary>
+
+```text
+herdr-synapse superuser [-h] [--json] [--team NAME|PATH] [--session NAME] [--socket PATH] [--session-mismatch-ok] {list,designate,revoke} ...
 ```
 
 </details>
@@ -468,7 +487,7 @@ herdr-synapse audit [-h] [--json] [--team NAME|PATH] [--session NAME] [--socket 
 </details>
 
 <details>
-<summary><code>charter</code> — print, set, edit, or list the history of the team charter (human only to write)</summary>
+<summary><code>charter</code> — print, set, edit, or list the history of the team charter (human or a delegate of this team writes it)</summary>
 
 ```text
 herdr-synapse charter [-h] [--json] [--team NAME|PATH] [--session NAME] [--socket PATH] [--session-mismatch-ok] [--file PATH] [--ref PATH] [--urgent] [what] [text]
